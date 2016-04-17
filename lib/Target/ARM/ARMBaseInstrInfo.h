@@ -86,6 +86,18 @@ protected:
                             RegSubRegPair &BaseReg,
                             RegSubRegPairAndIdx &InsertedReg) const override;
 
+  /// Commutes the operands in the given instruction.
+  /// The commutable operands are specified by their indices OpIdx1 and OpIdx2.
+  ///
+  /// Do not call this method for a non-commutable instruction or for
+  /// non-commutable pair of operand indices OpIdx1 and OpIdx2.
+  /// Even though the instruction is commutable, the method may still
+  /// fail to commute the operands, null pointer is returned in such cases.
+  MachineInstr *commuteInstructionImpl(MachineInstr *MI,
+                                       bool NewMI,
+                                       unsigned OpIdx1,
+                                       unsigned OpIdx2) const override;
+
 public:
   // Return whether the target has an explicit NOP encoding.
   bool hasNOP() const;
@@ -123,24 +135,24 @@ public:
   ReverseBranchCondition(SmallVectorImpl<MachineOperand> &Cond) const override;
 
   // Predication support.
-  bool isPredicated(const MachineInstr *MI) const override;
+  bool isPredicated(const MachineInstr &MI) const override;
 
-  ARMCC::CondCodes getPredicate(const MachineInstr *MI) const {
-    int PIdx = MI->findFirstPredOperandIdx();
-    return PIdx != -1 ? (ARMCC::CondCodes)MI->getOperand(PIdx).getImm()
+  ARMCC::CondCodes getPredicate(const MachineInstr &MI) const {
+    int PIdx = MI.findFirstPredOperandIdx();
+    return PIdx != -1 ? (ARMCC::CondCodes)MI.getOperand(PIdx).getImm()
                       : ARMCC::AL;
   }
 
-  bool PredicateInstruction(MachineInstr *MI,
-                    ArrayRef<MachineOperand> Pred) const override;
+  bool PredicateInstruction(MachineInstr &MI,
+                            ArrayRef<MachineOperand> Pred) const override;
 
   bool SubsumesPredicate(ArrayRef<MachineOperand> Pred1,
                          ArrayRef<MachineOperand> Pred2) const override;
 
-  bool DefinesPredicate(MachineInstr *MI,
+  bool DefinesPredicate(MachineInstr &MI,
                         std::vector<MachineOperand> &Pred) const override;
 
-  bool isPredicable(MachineInstr *MI) const override;
+  bool isPredicable(MachineInstr &MI) const override;
 
   /// GetInstSize - Returns the size of the specified MachineInstr.
   ///
@@ -188,9 +200,6 @@ public:
   MachineInstr *duplicate(MachineInstr *Orig,
                           MachineFunction &MF) const override;
 
-  MachineInstr *commuteInstruction(MachineInstr*,
-                                   bool=false) const override;
-
   const MachineInstrBuilder &AddDReg(MachineInstrBuilder &MIB, unsigned Reg,
                                      unsigned SubIdx, unsigned State,
                                      const TargetRegisterInfo *TRI) const;
@@ -224,15 +233,15 @@ public:
 
   bool isProfitableToIfCvt(MachineBasicBlock &MBB,
                            unsigned NumCycles, unsigned ExtraPredCycles,
-                           const BranchProbability &Probability) const override;
+                           BranchProbability Probability) const override;
 
   bool isProfitableToIfCvt(MachineBasicBlock &TMBB, unsigned NumT,
                            unsigned ExtraT, MachineBasicBlock &FMBB,
                            unsigned NumF, unsigned ExtraF,
-                           const BranchProbability &Probability) const override;
+                           BranchProbability Probability) const override;
 
   bool isProfitableToDupForIfCvt(MachineBasicBlock &MBB, unsigned NumCycles,
-                          const BranchProbability &Probability) const override {
+                                 BranchProbability Probability) const override {
     return NumCycles == 1;
   }
 
@@ -318,7 +327,7 @@ private:
                         const MCInstrDesc &UseMCID,
                         unsigned UseIdx, unsigned UseAlign) const;
 
-  unsigned getPredicationCost(const MachineInstr *MI) const override;
+  unsigned getPredicationCost(const MachineInstr &MI) const override;
 
   unsigned getInstrLatency(const InstrItineraryData *ItinData,
                            const MachineInstr *MI,
@@ -342,6 +351,8 @@ private:
 
   virtual void expandLoadStackGuard(MachineBasicBlock::iterator MI,
                                     Reloc::Model RM) const = 0;
+
+  void expandMEMCPY(MachineBasicBlock::iterator) const;
 
 private:
   /// Modeling special VFP / NEON fp MLA / MLS hazards.
@@ -436,7 +447,7 @@ static inline bool isPushOpcode(int Opc) {
 /// getInstrPredicate - If instruction is predicated, returns its predicate
 /// condition, otherwise returns AL. It also returns the condition code
 /// register by reference.
-ARMCC::CondCodes getInstrPredicate(const MachineInstr *MI, unsigned &PredReg);
+ARMCC::CondCodes getInstrPredicate(const MachineInstr &MI, unsigned &PredReg);
 
 unsigned getMatchingCondBranchOpcode(unsigned Opc);
 

@@ -79,6 +79,11 @@ namespace llvm {
       /// compute an allocation on the stack.
       DYNALLOC,
 
+      /// This instruction is lowered in PPCRegisterInfo::eliminateFrameIndex to
+      /// compute an offset from native SP to the address  of the most recent
+      /// dynamic alloca.
+      DYNAREAOFFSET,
+
       /// GlobalBaseReg - On Darwin, this node represents the result of the mflr
       /// at function entry, used for PIC code.
       GlobalBaseReg,
@@ -423,6 +428,8 @@ namespace llvm {
     /// DAG node.
     const char *getTargetNodeName(unsigned Opcode) const override;
 
+    bool useSoftFloat() const override;
+
     MVT getScalarShiftAmountTy(const DataLayout &, EVT) const override {
       return MVT::i32;
     }
@@ -434,6 +441,18 @@ namespace llvm {
     bool isCheapToSpeculateCtlz() const override {
       return true;
     }
+
+    bool supportSplitCSR(MachineFunction *MF) const override {
+      return
+        MF->getFunction()->getCallingConv() == CallingConv::CXX_FAST_TLS &&
+        MF->getFunction()->hasFnAttribute(Attribute::NoUnwind);
+    }
+
+    void initializeSplitCSR(MachineBasicBlock *Entry) const override;
+
+    void insertCopiesSplitCSR(
+      MachineBasicBlock *Entry,
+      const SmallVectorImpl<MachineBasicBlock *> &Exits) const override;
 
     /// getSetCCResultType - Return the ISD::SETCC ValueType
     EVT getSetCCResultType(const DataLayout &DL, LLVMContext &Context,
@@ -500,6 +519,10 @@ namespace llvm {
                                        unsigned Depth = 0) const override;
 
     unsigned getPrefLoopAlignment(MachineLoop *ML) const override;
+
+    bool shouldInsertFencesForAtomic(const Instruction *I) const override {
+      return true;
+    }
 
     Instruction* emitLeadingFence(IRBuilder<> &Builder, AtomicOrdering Ord,
                                   bool IsStore, bool IsLoad) const override;
@@ -655,8 +678,17 @@ namespace llvm {
       return Ty->isArrayTy();
     }
 
-  private:
+    /// If a physical register, this returns the register that receives the
+    /// exception address on entry to an EH pad.
+    unsigned
+    getExceptionPointerRegister(const Constant *PersonalityFn) const override;
 
+    /// If a physical register, this returns the register that receives the
+    /// exception typeid on entry to a landing pad.
+    unsigned
+    getExceptionSelectorRegister(const Constant *PersonalityFn) const override;
+
+  private:
     struct ReuseLoadInfo {
       SDValue Ptr;
       SDValue Chain;
@@ -693,6 +725,16 @@ namespace llvm {
                                       const SmallVectorImpl<ISD::InputArg> &Ins,
                                       SelectionDAG& DAG) const;
 
+    bool
+    IsEligibleForTailCallOptimization_64SVR4(
+                                    SDValue Callee,
+                                    CallingConv::ID CalleeCC,
+                                    ImmutableCallSite *CS,
+                                    bool isVarArg,
+                                    const SmallVectorImpl<ISD::OutputArg> &Outs,
+                                    const SmallVectorImpl<ISD::InputArg> &Ins,
+                                    SelectionDAG& DAG) const;
+
     SDValue EmitTailCallLoadFPAndRetAddr(SelectionDAG & DAG,
                                          int SPDiff,
                                          SDValue Chain,
@@ -719,6 +761,8 @@ namespace llvm {
                         const PPCSubtarget &Subtarget) const;
     SDValue LowerSTACKRESTORE(SDValue Op, SelectionDAG &DAG,
                                 const PPCSubtarget &Subtarget) const;
+    SDValue LowerGET_DYNAMIC_AREA_OFFSET(SDValue Op, SelectionDAG &DAG,
+                                         const PPCSubtarget &Subtarget) const;
     SDValue LowerDYNAMIC_STACKALLOC(SDValue Op, SelectionDAG &DAG,
                                       const PPCSubtarget &Subtarget) const;
     SDValue LowerLOAD(SDValue Op, SelectionDAG &DAG) const;

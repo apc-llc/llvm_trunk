@@ -15,7 +15,6 @@
 #ifndef LLVM_IR_GLOBALOBJECT_H
 #define LLVM_IR_GLOBALOBJECT_H
 
-#include "llvm/IR/Constant.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/GlobalValue.h"
 
@@ -27,13 +26,10 @@ class GlobalObject : public GlobalValue {
   GlobalObject(const GlobalObject &) = delete;
 
 protected:
-  GlobalObject(PointerType *Ty, ValueTy VTy, Use *Ops, unsigned NumOps,
-               LinkageTypes Linkage, const Twine &Name) = delete;
   GlobalObject(Type *Ty, ValueTy VTy, Use *Ops, unsigned NumOps,
                LinkageTypes Linkage, const Twine &Name,
                unsigned AddressSpace = 0)
-      : GlobalValue(PointerType::get(Ty, AddressSpace), VTy, Ops, NumOps,
-                    Linkage, Name),
+      : GlobalValue(Ty, VTy, Ops, NumOps, Linkage, Name, AddressSpace),
         ObjComdat(nullptr) {
     setGlobalValueSubClassData(0);
   }

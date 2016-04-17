@@ -63,8 +63,6 @@ namespace llvm {
 
       BCC_i64,
 
-      RBIT,         // ARM bitreverse instruction
-
       SRL_FLAG,     // V,Flag = srl_flag X -> srl X, 1 + save carry out.
       SRA_FLAG,     // V,Flag = sra_flag X -> sra X, 1 + save carry out.
       RRX,          // V = RRX X, Flag     -> srl X, 1 + shift in carry flag.
@@ -92,6 +90,7 @@ namespace llvm {
       PRELOAD,      // Preload
 
       WIN__CHKSTK,  // Windows' __chkstk call to do stack probing.
+      WIN__DBZCHK,  // Windows' divide by zero check
 
       VCEQ,         // Vector compare equal.
       VCEQZ,        // Vector compare equal to zero.
@@ -184,6 +183,10 @@ namespace llvm {
       // Vector bitwise select
       VBSL,
 
+      // Pseudo-instruction representing a memory copy using ldm/stm
+      // instructions.
+      MEMCPY,
+
       // Vector load N-element structure to all lanes:
       VLD2DUP = ISD::FIRST_TARGET_MEMORY_OPCODE,
       VLD3DUP,
@@ -255,6 +258,8 @@ namespace llvm {
                                        SDNode *Node) const override;
 
     SDValue PerformCMOVCombine(SDNode *N, SelectionDAG &DAG) const;
+    SDValue PerformBRCONDCombine(SDNode *N, SelectionDAG &DAG) const;
+    SDValue PerformCMOVToBFICombine(SDNode *N, SelectionDAG &DAG) const;
     SDValue PerformDAGCombine(SDNode *N, DAGCombinerInfo &DCI) const override;
 
     bool isDesirableToTransformToIntegerOp(unsigned Opc, EVT VT) const override;
@@ -343,6 +348,8 @@ namespace llvm {
     getInlineAsmMemConstraint(StringRef ConstraintCode) const override {
       if (ConstraintCode == "Q")
         return InlineAsm::Constraint_Q;
+      else if (ConstraintCode == "o")
+        return InlineAsm::Constraint_o;
       else if (ConstraintCode.size() == 2) {
         if (ConstraintCode[0] == 'U') {
           switch(ConstraintCode[1]) {
@@ -415,12 +422,23 @@ namespace llvm {
     bool functionArgumentNeedsConsecutiveRegisters(
         Type *Ty, CallingConv::ID CallConv, bool isVarArg) const override;
 
-    bool hasLoadLinkedStoreConditional() const override;
+    /// If a physical register, this returns the register that receives the
+    /// exception address on entry to an EH pad.
+    unsigned
+    getExceptionPointerRegister(const Constant *PersonalityFn) const override;
+
+    /// If a physical register, this returns the register that receives the
+    /// exception typeid on entry to a landing pad.
+    unsigned
+    getExceptionSelectorRegister(const Constant *PersonalityFn) const override;
+
     Instruction *makeDMB(IRBuilder<> &Builder, ARM_MB::MemBOpt Domain) const;
     Value *emitLoadLinked(IRBuilder<> &Builder, Value *Addr,
                           AtomicOrdering Ord) const override;
     Value *emitStoreConditional(IRBuilder<> &Builder, Value *Val,
                                 Value *Addr, AtomicOrdering Ord) const override;
+
+    void emitAtomicCmpXchgNoStoreLLBalance(IRBuilder<> &Builder) const override;
 
     Instruction* emitLeadingFence(IRBuilder<> &Builder, AtomicOrdering Ord,
                           bool IsStore, bool IsLoad) const override;
@@ -436,15 +454,25 @@ namespace llvm {
     bool lowerInterleavedStore(StoreInst *SI, ShuffleVectorInst *SVI,
                                unsigned Factor) const override;
 
-    bool shouldExpandAtomicLoadInIR(LoadInst *LI) const override;
+    bool shouldInsertFencesForAtomic(const Instruction *I) const override;
+    TargetLoweringBase::AtomicExpansionKind
+    shouldExpandAtomicLoadInIR(LoadInst *LI) const override;
     bool shouldExpandAtomicStoreInIR(StoreInst *SI) const override;
-    TargetLoweringBase::AtomicRMWExpansionKind
+    TargetLoweringBase::AtomicExpansionKind
     shouldExpandAtomicRMWInIR(AtomicRMWInst *AI) const override;
+    bool shouldExpandAtomicCmpXchgInIR(AtomicCmpXchgInst *AI) const override;
 
     bool useLoadStackGuardNode() const override;
 
     bool canCombineStoreAndExtract(Type *VectorTy, Value *Idx,
                                    unsigned &Cost) const override;
+
+    bool isCheapToSpeculateCttz() const override;
+    bool isCheapToSpeculateCtlz() const override;
+
+    bool supportSwiftError() const override {
+      return true;
+    }
 
   protected:
     std::pair<const TargetRegisterClass *, uint8_t>
@@ -463,6 +491,10 @@ namespace llvm {
     /// ARMPCLabelIndex - Keep track of the number of ARM PC labels created.
     ///
     unsigned ARMPCLabelIndex;
+
+    // TODO: remove this, and have shouldInsertFencesForAtomic do the proper
+    // check.
+    bool InsertFencesForAtomic;
 
     void addTypeForNEON(MVT VT, MVT PromotedLdStVT, MVT PromotedBitwiseVT);
     void addDRTypeForNEON(MVT VT);
@@ -504,6 +536,8 @@ namespace llvm {
     SDValue LowerToTLSExecModels(GlobalAddressSDNode *GA,
                                  SelectionDAG &DAG,
                                  TLSModel::Model model) const;
+    SDValue LowerGlobalTLSAddressDarwin(SDValue Op, SelectionDAG &DAG) const;
+    SDValue LowerGlobalTLSAddressWindows(SDValue Op, SelectionDAG &DAG) const;
     SDValue LowerGLOBAL_OFFSET_TABLE(SDValue Op, SelectionDAG &DAG) const;
     SDValue LowerBR_JT(SDValue Op, SelectionDAG &DAG) const;
     SDValue LowerXALUO(SDValue Op, SelectionDAG &DAG) const;
@@ -522,6 +556,11 @@ namespace llvm {
                               const ARMSubtarget *ST) const;
     SDValue LowerFSINCOS(SDValue Op, SelectionDAG &DAG) const;
     SDValue LowerDivRem(SDValue Op, SelectionDAG &DAG) const;
+    SDValue LowerDIV_Windows(SDValue Op, SelectionDAG &DAG, bool Signed) const;
+    void ExpandDIV_Windows(SDValue Op, SelectionDAG &DAG, bool Signed,
+                           SmallVectorImpl<SDValue> &Results) const;
+    SDValue LowerWindowsDIVLibCall(SDValue Op, SelectionDAG &DAG, bool Signed,
+                                   SDValue &Chain) const;
     SDValue LowerREM(SDNode *N, SelectionDAG &DAG) const;
     SDValue LowerDYNAMIC_STACKALLOC(SDValue Op, SelectionDAG &DAG) const;
     SDValue LowerFP_ROUND(SDValue Op, SelectionDAG &DAG) const;
@@ -551,6 +590,15 @@ namespace llvm {
                             SDLoc dl, SelectionDAG &DAG,
                             SmallVectorImpl<SDValue> &InVals,
                             bool isThisReturn, SDValue ThisVal) const;
+
+    bool supportSplitCSR(MachineFunction *MF) const override {
+      return MF->getFunction()->getCallingConv() == CallingConv::CXX_FAST_TLS &&
+          MF->getFunction()->hasFnAttribute(Attribute::NoUnwind);
+    }
+    void initializeSplitCSR(MachineBasicBlock *Entry) const override;
+    void insertCopiesSplitCSR(
+      MachineBasicBlock *Entry,
+      const SmallVectorImpl<MachineBasicBlock *> &Exits) const override;
 
     SDValue
       LowerFormalArguments(SDValue Chain,
@@ -631,6 +679,8 @@ namespace llvm {
                                        MachineBasicBlock *MBB) const;
 
     MachineBasicBlock *EmitLowered__chkstk(MachineInstr *MI,
+                                           MachineBasicBlock *MBB) const;
+    MachineBasicBlock *EmitLowered__dbzchk(MachineInstr *MI,
                                            MachineBasicBlock *MBB) const;
   };
 

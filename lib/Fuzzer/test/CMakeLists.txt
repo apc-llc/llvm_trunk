@@ -13,26 +13,47 @@ set(DFSanTests
   )
 
 set(Tests
+  BufferOverflowOnInput
+  CallerCalleeTest
   CounterTest
-  CxxTokensTest
+  CustomMutatorTest
   FourIndependentBranchesTest
   FullCoverageSetTest
-  InfiniteTest
+  InitializeTest
   MemcmpTest
+  LeakTest
+  LeakTimeoutTest
   NullDerefTest
+  NthRunCrashTest
+  RepeatedMemcmp
   SimpleCmpTest
   SimpleDictionaryTest
+  SimpleFnAdapterTest
+  SimpleHashTest
   SimpleTest
+  SpamyTest
   StrcmpTest
   StrncmpTest
   SwitchTest
+  ThreadedTest
   TimeoutTest
   )
 
 set(CustomMainTests
-  UserSuppliedFuzzerTest
   )
 
+set(UninstrumentedTests
+  UninstrumentedTest
+  )
+
+set(TraceBBTests
+  SimpleTest
+  )
+
+set(TracePCTests
+  FourIndependentBranchesTest
+  FullCoverageSetTest
+  )
 
 set(TestBinaries)
 
@@ -72,6 +93,7 @@ include_directories(${LLVM_MAIN_SRC_DIR}/utils/unittest/googletest/include)
 
 add_executable(LLVMFuzzer-Unittest
   FuzzerUnittest.cpp
+  FuzzerFnAdapterUnittest.cpp
   $<TARGET_OBJECTS:LLVMFuzzerNoMainObjects>
   )
 
@@ -88,6 +110,23 @@ foreach(Test ${DFSanTests})
   set(TestBinaries ${TestBinaries} LLVMFuzzer-${Test}-DFSan)
 endforeach()
 
+add_subdirectory(uninstrumented)
+
+foreach(Test ${UninstrumentedTests})
+  set(TestBinaries ${TestBinaries} LLVMFuzzer-${Test}-Uninstrumented)
+endforeach()
+
+add_subdirectory(trace-bb)
+
+foreach(Test ${TraceBBTests})
+  set(TestBinaries ${TestBinaries} LLVMFuzzer-${Test}-TraceBB)
+endforeach()
+
+add_subdirectory(trace-pc)
+
+foreach(Test ${TracePCTests})
+  set(TestBinaries ${TestBinaries} LLVMFuzzer-${Test}-TracePC)
+endforeach()
 
 set_target_properties(${TestBinaries}
   PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}

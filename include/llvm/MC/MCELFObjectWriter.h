@@ -17,6 +17,7 @@
 
 namespace llvm {
 class MCAssembler;
+class MCContext;
 class MCFixup;
 class MCFragment;
 class MCObjectWriter;
@@ -57,8 +58,6 @@ public:
       case Triple::PS4:
       case Triple::FreeBSD:
         return ELF::ELFOSABI_FREEBSD;
-      case Triple::Linux:
-        return ELF::ELFOSABI_LINUX;
       default:
         return ELF::ELFOSABI_NONE;
     }
@@ -66,8 +65,8 @@ public:
 
   virtual ~MCELFObjectTargetWriter() {}
 
-  virtual unsigned GetRelocType(const MCValue &Target, const MCFixup &Fixup,
-                                bool IsPCRel) const = 0;
+  virtual unsigned getRelocType(MCContext &Ctx, const MCValue &Target,
+                                const MCFixup &Fixup, bool IsPCRel) const = 0;
 
   virtual bool needsRelocateWithSymbol(const MCSymbol &Sym,
                                        unsigned Type) const;

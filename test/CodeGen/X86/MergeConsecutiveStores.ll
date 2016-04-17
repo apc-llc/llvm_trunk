@@ -1,4 +1,5 @@
-; RUN: llc -mtriple=x86_64-unknown-unknown -mattr=+avx < %s | FileCheck %s
+; RUN: llc -mtriple=x86_64-unknown-unknown -mattr=+avx -fixup-byte-word-insts=1 < %s | FileCheck -check-prefix=CHECK -check-prefix=BWON %s
+; RUN: llc -mtriple=x86_64-unknown-unknown -mattr=+avx -fixup-byte-word-insts=0 < %s | FileCheck -check-prefix=CHECK -check-prefix=BWOFF %s
 ; RUN: llc -mtriple=x86_64-unknown-unknown -mattr=+avx -addr-sink-using-gep=1 < %s | FileCheck %s
 
 %struct.A = type { i8, i8, i8, i8, i8, i8, i8, i8 }
@@ -147,7 +148,8 @@ define void @merge_nonconst_store(i32 %count, i8 %zz, %struct.A* nocapture %p) n
 
 ; CHECK-LABEL: merge_loads_i16:
 ;  load:
-; CHECK: movw
+; BWON:  movzwl
+; BWOFF: movw
 ;  store:
 ; CHECK: movw
 ; CHECK: ret
@@ -180,7 +182,8 @@ define void @merge_loads_i16(i32 %count, %struct.A* noalias nocapture %q, %struc
 
 ; The loads and the stores are interleaved. Can't merge them.
 ; CHECK-LABEL: no_merge_loads:
-; CHECK: movb
+; BWON:  movzbl
+; BWOFF: movb
 ; CHECK: movb
 ; CHECK: movb
 ; CHECK: movb
@@ -288,12 +291,16 @@ block4:                                       ; preds = %4, %.lr.ph
   ret void
 }
 
-;; On x86, even unaligned copies can be merged to vector ops.
+;; On x86, even unaligned copies should be merged to vector ops.
+;; TODO: however, this cannot happen at the moment, due to brokenness
+;; in MergeConsecutiveStores. See UseAA FIXME in DAGCombiner.cpp
+;; visitSTORE.
+
 ; CHECK-LABEL: merge_loads_no_align:
 ;  load:
-; CHECK: vmovups
+; CHECK-NOT: vmovups ;; TODO
 ;  store:
-; CHECK: vmovups
+; CHECK-NOT: vmovups ;; TODO
 ; CHECK: ret
 define void @merge_loads_no_align(i32 %count, %struct.B* noalias nocapture %q, %struct.B* noalias nocapture %p) nounwind uwtable noinline ssp {
   %a1 = icmp sgt i32 %count, 0
@@ -478,10 +485,8 @@ define void @merge_vec_extract_stores(<8 x float> %v1, <8 x float> %v2, <4 x flo
   ret void
 
 ; CHECK-LABEL: merge_vec_extract_stores
-; CHECK:      vmovaps %xmm0, 48(%rdi)
-; CHECK-NEXT: vextractf128 $1, %ymm0, 64(%rdi)
-; CHECK-NEXT: vmovaps %xmm1, 80(%rdi)
-; CHECK-NEXT: vextractf128 $1, %ymm1, 96(%rdi)
+; CHECK:      vmovups %ymm0, 48(%rdi)
+; CHECK-NEXT: vmovups %ymm1, 80(%rdi)
 ; CHECK-NEXT: vzeroupper
 ; CHECK-NEXT: retq
 }

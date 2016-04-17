@@ -26,6 +26,8 @@
 #include "llvm/CodeGen/MachineInstrBuilder.h"
 #include "llvm/CodeGen/MachineRegisterInfo.h"
 
+#define DEBUG_TYPE "si-insert-waits"
+
 using namespace llvm;
 
 namespace {
@@ -53,7 +55,6 @@ typedef std::pair<unsigned, unsigned> RegInterval;
 class SIInsertWaits : public MachineFunctionPass {
 
 private:
-  static char ID;
   const SIInstrInfo *TII;
   const SIRegisterInfo *TRI;
   const MachineRegisterInfo *MRI;
@@ -84,6 +85,12 @@ private:
 
   bool LastInstWritesM0;
 
+  /// \brief Whether the machine function returns void
+  bool ReturnsVoid;
+
+  /// Whether the VCCZ bit is possibly corrupt
+  bool VCCZCorrupt;
+
   /// \brief Get increment/decrement amount for this instruction.
   Counters getHwCounts(MachineInstr &MI);
 
@@ -91,7 +98,8 @@ private:
   bool isOpRelevant(MachineOperand &Op);
 
   /// \brief Get register interval an operand affects.
-  RegInterval getRegInterval(MachineOperand &Op);
+  RegInterval getRegInterval(const TargetRegisterClass *RC,
+                             const MachineOperand &Reg) const;
 
   /// \brief Handle instructions async components
   void pushInstruction(MachineBasicBlock &MBB,
@@ -111,36 +119,73 @@ private:
   /// \brief Insert S_NOP between an instruction writing M0 and S_SENDMSG.
   void handleSendMsg(MachineBasicBlock &MBB, MachineBasicBlock::iterator I);
 
+  /// \param DPP The DPP instruction
+  /// \param SearchI The iterator to start look for hazards.
+  /// \param SearchMBB The basic block we are operating on.
+  /// \param WaitStates Then number of wait states that need to be inserted
+  ///                    When a hazard is detected.
+  void insertDPPWaitStates(MachineBasicBlock::iterator DPP,
+                           MachineBasicBlock::reverse_iterator SearchI,
+                           MachineBasicBlock *SearchMBB,
+                           unsigned WaitStates);
+
+  void insertDPPWaitStates(MachineBasicBlock::iterator DPP);
+
+  /// Return true if there are LGKM instrucitons that haven't been waited on
+  /// yet.
+  bool hasOutstandingLGKM() const;
+
 public:
-  SIInsertWaits(TargetMachine &tm) :
+  static char ID;
+
+  SIInsertWaits() :
     MachineFunctionPass(ID),
     TII(nullptr),
     TRI(nullptr),
-    ExpInstrTypesSeen(0) { }
+    ExpInstrTypesSeen(0),
+    VCCZCorrupt(false) { }
 
   bool runOnMachineFunction(MachineFunction &MF) override;
 
   const char *getPassName() const override {
-    return "SI insert wait  instructions";
+    return "SI insert wait instructions";
   }
 
+  void getAnalysisUsage(AnalysisUsage &AU) const override {
+    AU.setPreservesCFG();
+    MachineFunctionPass::getAnalysisUsage(AU);
+  }
 };
 
 } // End anonymous namespace
 
+INITIALIZE_PASS_BEGIN(SIInsertWaits, DEBUG_TYPE,
+                      "SI Insert Waits", false, false)
+INITIALIZE_PASS_END(SIInsertWaits, DEBUG_TYPE,
+                    "SI Insert Waits", false, false)
+
 char SIInsertWaits::ID = 0;
 
-const Counters SIInsertWaits::WaitCounts = { { 15, 7, 7 } };
+char &llvm::SIInsertWaitsID = SIInsertWaits::ID;
+
+FunctionPass *llvm::createSIInsertWaitsPass() {
+  return new SIInsertWaits();
+}
+
+const Counters SIInsertWaits::WaitCounts = { { 15, 7, 15 } };
 const Counters SIInsertWaits::ZeroCounts = { { 0, 0, 0 } };
 
-FunctionPass *llvm::createSIInsertWaits(TargetMachine &tm) {
-  return new SIInsertWaits(tm);
+static bool readsVCCZ(unsigned Opcode) {
+  return Opcode == AMDGPU::S_CBRANCH_VCCNZ || Opcode == AMDGPU::S_CBRANCH_VCCZ;
+}
+
+bool SIInsertWaits::hasOutstandingLGKM() const {
+  return WaitedOn.Named.LGKM != LastIssued.Named.LGKM;
 }
 
 Counters SIInsertWaits::getHwCounts(MachineInstr &MI) {
-
-  uint64_t TSFlags = TII->get(MI.getOpcode()).TSFlags;
-  Counters Result;
+  uint64_t TSFlags = MI.getDesc().TSFlags;
+  Counters Result = { { 0, 0, 0 } };
 
   Result.Named.VM = !!(TSFlags & SIInstrFlags::VM_CNT);
 
@@ -151,15 +196,22 @@ Counters SIInsertWaits::getHwCounts(MachineInstr &MI) {
   // LGKM may uses larger values
   if (TSFlags & SIInstrFlags::LGKM_CNT) {
 
-    if (TII->isSMRD(MI.getOpcode())) {
+    if (TII->isSMRD(MI)) {
 
-      MachineOperand &Op = MI.getOperand(0);
-      assert(Op.isReg() && "First LGKM operand must be a register!");
+      if (MI.getNumOperands() != 0) {
+        assert(MI.getOperand(0).isReg() &&
+               "First LGKM operand must be a register!");
 
-      unsigned Reg = Op.getReg();
-      unsigned Size = TRI->getMinimalPhysRegClass(Reg)->getSize();
-      Result.Named.LGKM = Size > 4 ? 2 : 1;
-
+        // XXX - What if this is a write into a super register?
+        const TargetRegisterClass *RC = TII->getOpRegClass(MI, 0);
+        unsigned Size = RC->getSize();
+        Result.Named.LGKM = Size > 4 ? 2 : 1;
+      } else {
+        // s_dcache_inv etc. do not have a a destination register. Assume we
+        // want a wait on these.
+        // XXX - What is the right value?
+        Result.Named.LGKM = 1;
+      }
     } else {
       // DS
       Result.Named.LGKM = 1;
@@ -173,9 +225,8 @@ Counters SIInsertWaits::getHwCounts(MachineInstr &MI) {
 }
 
 bool SIInsertWaits::isOpRelevant(MachineOperand &Op) {
-
   // Constants are always irrelevant
-  if (!Op.isReg())
+  if (!Op.isReg() || !TRI->isInAllocatableClass(Op.getReg()))
     return false;
 
   // Defines are always relevant
@@ -192,24 +243,23 @@ bool SIInsertWaits::isOpRelevant(MachineOperand &Op) {
     return false;
 
   // Check if this operand is the value being stored.
-  // Special case for DS instructions, since the address
+  // Special case for DS/FLAT instructions, since the address
   // operand comes before the value operand and it may have
   // multiple data operands.
 
-  if (TII->isDS(MI.getOpcode())) {
+  if (TII->isDS(MI) || TII->isFLAT(MI)) {
     MachineOperand *Data = TII->getNamedOperand(MI, AMDGPU::OpName::data);
     if (Data && Op.isIdenticalTo(*Data))
       return true;
+  }
 
+  if (TII->isDS(MI)) {
     MachineOperand *Data0 = TII->getNamedOperand(MI, AMDGPU::OpName::data0);
     if (Data0 && Op.isIdenticalTo(*Data0))
       return true;
 
     MachineOperand *Data1 = TII->getNamedOperand(MI, AMDGPU::OpName::data1);
-    if (Data1 && Op.isIdenticalTo(*Data1))
-      return true;
-
-    return false;
+    return Data1 && Op.isIdenticalTo(*Data1);
   }
 
   // NOTE: This assumes that the value operand is before the
@@ -224,18 +274,13 @@ bool SIInsertWaits::isOpRelevant(MachineOperand &Op) {
   return false;
 }
 
-RegInterval SIInsertWaits::getRegInterval(MachineOperand &Op) {
-
-  if (!Op.isReg() || !TRI->isInAllocatableClass(Op.getReg()))
-    return std::make_pair(0, 0);
-
-  unsigned Reg = Op.getReg();
-  unsigned Size = TRI->getMinimalPhysRegClass(Reg)->getSize();
-
+RegInterval SIInsertWaits::getRegInterval(const TargetRegisterClass *RC,
+                                          const MachineOperand &Reg) const {
+  unsigned Size = RC->getSize();
   assert(Size >= 4);
 
   RegInterval Result;
-  Result.first = TRI->getEncodingValue(Reg);
+  Result.first = TRI->getEncodingValue(Reg.getReg());
   Result.second = Result.first + Size / 4;
 
   return Result;
@@ -273,7 +318,7 @@ void SIInsertWaits::pushInstruction(MachineBasicBlock &MBB,
     // and destination registers don't overlap, e.g. this is illegal:
     //   r0 = load r2
     //   r2 = load r0
-    if ((LastOpcodeType == SMEM && TII->isSMRD(I->getOpcode())) ||
+    if ((LastOpcodeType == SMEM && TII->isSMRD(*I)) ||
         (LastOpcodeType == VMEM && Increment.Named.VM)) {
       // Insert a NOP to break the clause.
       BuildMI(MBB, I, DebugLoc(), TII->get(AMDGPU::S_NOP))
@@ -281,7 +326,7 @@ void SIInsertWaits::pushInstruction(MachineBasicBlock &MBB,
       LastInstWritesM0 = false;
     }
 
-    if (TII->isSMRD(I->getOpcode()))
+    if (TII->isSMRD(*I))
       LastOpcodeType = SMEM;
     else if (Increment.Named.VM)
       LastOpcodeType = VMEM;
@@ -293,12 +338,12 @@ void SIInsertWaits::pushInstruction(MachineBasicBlock &MBB,
   }
 
   for (unsigned i = 0, e = I->getNumOperands(); i != e; ++i) {
-
     MachineOperand &Op = I->getOperand(i);
     if (!isOpRelevant(Op))
       continue;
 
-    RegInterval Interval = getRegInterval(Op);
+    const TargetRegisterClass *RC = TII->getOpRegClass(*I, i);
+    RegInterval Interval = getRegInterval(RC, Op);
     for (unsigned j = Interval.first; j < Interval.second; ++j) {
 
       // Remember which registers we define
@@ -317,7 +362,9 @@ bool SIInsertWaits::insertWait(MachineBasicBlock &MBB,
                                const Counters &Required) {
 
   // End of program? No need to wait on anything
-  if (I != MBB.end() && I->getOpcode() == AMDGPU::S_ENDPGM)
+  // A function not returning void needs to wait, because other bytecode will
+  // be appended after it and we don't know what it will be.
+  if (I != MBB.end() && I->getOpcode() == AMDGPU::S_ENDPGM && ReturnsVoid)
     return false;
 
   // Figure out if the async instructions execute in order
@@ -369,7 +416,7 @@ bool SIInsertWaits::insertWait(MachineBasicBlock &MBB,
   BuildMI(MBB, I, DebugLoc(), TII->get(AMDGPU::S_WAITCNT))
           .addImm((Counts.Named.VM & 0xF) |
                   ((Counts.Named.EXP & 0x7) << 4) |
-                  ((Counts.Named.LGKM & 0x7) << 8));
+                  ((Counts.Named.LGKM & 0xF) << 8));
 
   LastOpcodeType = OTHER;
   LastInstWritesM0 = false;
@@ -393,12 +440,18 @@ Counters SIInsertWaits::handleOperands(MachineInstr &MI) {
   if (MI.getOpcode() == AMDGPU::S_SENDMSG)
     return LastIssued;
 
-  // For each register affected by this
-  // instruction increase the result sequence
+  // For each register affected by this instruction increase the result
+  // sequence.
+  //
+  // TODO: We could probably just look at explicit operands if we removed VCC /
+  // EXEC from SMRD dest reg classes.
   for (unsigned i = 0, e = MI.getNumOperands(); i != e; ++i) {
-
     MachineOperand &Op = MI.getOperand(i);
-    RegInterval Interval = getRegInterval(Op);
+    if (!Op.isReg() || !TRI->isInAllocatableClass(Op.getReg()))
+      continue;
+
+    const TargetRegisterClass *RC = TII->getOpRegClass(MI, i);
+    RegInterval Interval = getRegInterval(RC, Op);
     for (unsigned j = Interval.first; j < Interval.second; ++j) {
 
       if (Op.isDef()) {
@@ -439,6 +492,45 @@ void SIInsertWaits::handleSendMsg(MachineBasicBlock &MBB,
   }
 }
 
+void SIInsertWaits::insertDPPWaitStates(MachineBasicBlock::iterator DPP,
+                                        MachineBasicBlock::reverse_iterator SearchI,
+                                        MachineBasicBlock *SearchMBB,
+                                        unsigned WaitStates) {
+
+  MachineBasicBlock::reverse_iterator E = SearchMBB->rend();
+
+  for (; WaitStates > 0; --WaitStates, ++SearchI) {
+
+    // If we have reached the start of the block, we need to check predecessors.
+    if (SearchI == E) {
+      for (MachineBasicBlock *Pred : SearchMBB->predecessors()) {
+        // We only need to check fall-through blocks.  Branch instructions
+        // give us enough wait states.
+        if (Pred->getFirstTerminator() == Pred->end()) {
+          insertDPPWaitStates(DPP, Pred->rbegin(), Pred, WaitStates);
+          break;
+        }
+      }
+      return;
+    }
+
+    for (MachineOperand &Op : SearchI->operands()) {
+      if (!Op.isReg() || !Op.isDef())
+        continue;
+
+      if (DPP->readsRegister(Op.getReg(), TRI)) {
+        TII->insertWaitStates(*DPP->getParent(), DPP, WaitStates);
+        return;
+      }
+    }
+  }
+}
+
+void SIInsertWaits::insertDPPWaitStates(MachineBasicBlock::iterator DPP) {
+  MachineBasicBlock::reverse_iterator I(DPP);
+  insertDPPWaitStates(DPP, I, DPP->getParent(), 2);
+}
+
 // FIXME: Insert waits listed in Table 4.2 "Required User-Inserted Wait States"
 // around other non-memory instructions.
 bool SIInsertWaits::runOnMachineFunction(MachineFunction &MF) {
@@ -448,12 +540,14 @@ bool SIInsertWaits::runOnMachineFunction(MachineFunction &MF) {
   TRI =
       static_cast<const SIRegisterInfo *>(MF.getSubtarget().getRegisterInfo());
 
+  const AMDGPUSubtarget &ST = MF.getSubtarget<AMDGPUSubtarget>();
   MRI = &MF.getRegInfo();
 
   WaitedOn = ZeroCounts;
   LastIssued = ZeroCounts;
   LastOpcodeType = OTHER;
   LastInstWritesM0 = false;
+  ReturnsVoid = MF.getInfo<SIMachineFunctionInfo>()->returnsVoid();
 
   memset(&UsedRegs, 0, sizeof(UsedRegs));
   memset(&DefinedRegs, 0, sizeof(DefinedRegs));
@@ -464,6 +558,54 @@ bool SIInsertWaits::runOnMachineFunction(MachineFunction &MF) {
     MachineBasicBlock &MBB = *BI;
     for (MachineBasicBlock::iterator I = MBB.begin(), E = MBB.end();
          I != E; ++I) {
+
+      if (ST.getGeneration() <= AMDGPUSubtarget::SEA_ISLANDS) {
+        // There is a hardware bug on CI/SI where SMRD instruction may corrupt
+        // vccz bit, so when we detect that an instruction may read from a
+        // corrupt vccz bit, we need to:
+        // 1. Insert s_waitcnt lgkm(0) to wait for all outstanding SMRD operations to
+        //    complete.
+        // 2. Restore the correct value of vccz by writing the current value
+        //    of vcc back to vcc.
+
+        if (TII->isSMRD(I->getOpcode())) {
+          VCCZCorrupt = true;
+        } else if (!hasOutstandingLGKM() && I->modifiesRegister(AMDGPU::VCC, TRI)) {
+          // FIXME: We only care about SMRD instructions here, not LDS or GDS.
+          // Whenever we store a value in vcc, the correct value of vccz is
+          // restored.
+          VCCZCorrupt = false;
+        }
+
+        // Check if we need to apply the bug work-around
+        if (readsVCCZ(I->getOpcode()) && VCCZCorrupt) {
+          DEBUG(dbgs() << "Inserting vccz bug work-around before: " << *I << '\n');
+
+          // Wait on everything, not just LGKM.  vccz reads usually come from
+          // terminators, and we always wait on everything at the end of the
+          // block, so if we only wait on LGKM here, we might end up with
+          // another s_waitcnt inserted right after this if there are non-LGKM
+          // instructions still outstanding.
+          insertWait(MBB, I, LastIssued);
+
+          // Restore the vccz bit.  Any time a value is written to vcc, the vcc
+          // bit is updated, so we can restore the bit by reading the value of
+          // vcc and then writing it back to the register.
+          BuildMI(MBB, I, I->getDebugLoc(), TII->get(AMDGPU::S_MOV_B64),
+                  AMDGPU::VCC)
+                  .addReg(AMDGPU::VCC);
+        }
+      }
+
+      if (TII->isDPP(*I)) {
+        insertDPPWaitStates(I);
+      }
+
+      // Insert required wait states for SMRD reading an SGPR written by a VALU
+      // instruction.
+      if (ST.getGeneration() <= AMDGPUSubtarget::SOUTHERN_ISLANDS &&
+          I->getOpcode() == AMDGPU::V_READFIRSTLANE_B32)
+        TII->insertWaitStates(MBB, std::next(I), 4);
 
       // Wait for everything before a barrier.
       if (I->getOpcode() == AMDGPU::S_BARRIER)

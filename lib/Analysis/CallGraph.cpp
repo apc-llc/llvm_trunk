@@ -127,9 +127,8 @@ void CallGraph::print(raw_ostream &OS) const {
     CN->print(OS);
 }
 
-#if !defined(NDEBUG) || defined(LLVM_ENABLE_DUMP)
+LLVM_DUMP_METHOD
 void CallGraph::dump() const { print(dbgs()); }
-#endif
 
 // removeFunctionFromModule - Unlink the function from this module, returning
 // it.  Because this removes the function from the module, the call graph node
@@ -197,9 +196,8 @@ void CallGraphNode::print(raw_ostream &OS) const {
   OS << '\n';
 }
 
-#if !defined(NDEBUG) || defined(LLVM_ENABLE_DUMP)
+LLVM_DUMP_METHOD
 void CallGraphNode::dump() const { print(dbgs()); }
-#endif
 
 /// removeCallEdgeFor - This method removes the edge in the node for the
 /// specified call site.  Note that this method takes linear time, so it
@@ -261,11 +259,18 @@ void CallGraphNode::replaceCallEdge(CallSite CS,
   }
 }
 
+// Provide an explicit template instantiation for the static ID.
+char CallGraphAnalysis::PassID;
+
+PreservedAnalyses CallGraphPrinterPass::run(Module &M,
+                                            AnalysisManager<Module> &AM) {
+  AM.getResult<CallGraphAnalysis>(M).print(OS);
+  return PreservedAnalyses::all();
+}
+
 //===----------------------------------------------------------------------===//
 // Out-of-line definitions of CallGraphAnalysis class members.
 //
-
-char CallGraphAnalysis::PassID;
 
 //===----------------------------------------------------------------------===//
 // Implementations of the CallGraphWrapperPass class methods.
@@ -304,6 +309,31 @@ void CallGraphWrapperPass::print(raw_ostream &OS, const Module *) const {
   G->print(OS);
 }
 
-#if !defined(NDEBUG) || defined(LLVM_ENABLE_DUMP)
+LLVM_DUMP_METHOD
 void CallGraphWrapperPass::dump() const { print(dbgs(), nullptr); }
-#endif
+
+namespace {
+struct CallGraphPrinterLegacyPass : public ModulePass {
+  static char ID; // Pass ID, replacement for typeid
+  CallGraphPrinterLegacyPass() : ModulePass(ID) {
+    initializeCallGraphPrinterLegacyPassPass(*PassRegistry::getPassRegistry());
+  }
+
+  void getAnalysisUsage(AnalysisUsage &AU) const override {
+    AU.setPreservesAll();
+    AU.addRequiredTransitive<CallGraphWrapperPass>();
+  }
+  bool runOnModule(Module &M) override {
+    getAnalysis<CallGraphWrapperPass>().print(errs(), &M);
+    return false;
+  }
+};
+}
+
+char CallGraphPrinterLegacyPass::ID = 0;
+
+INITIALIZE_PASS_BEGIN(CallGraphPrinterLegacyPass, "print-callgraph",
+                      "Print a call graph", true, true)
+INITIALIZE_PASS_DEPENDENCY(CallGraphWrapperPass)
+INITIALIZE_PASS_END(CallGraphPrinterLegacyPass, "print-callgraph",
+                    "Print a call graph", true, true)

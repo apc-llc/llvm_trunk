@@ -31,9 +31,12 @@ using namespace llvm;
 #define DEBUG_TYPE "reg-scavenging"
 
 /// setUsed - Set the register units of this register as used.
-void RegScavenger::setRegUsed(unsigned Reg) {
-  for (MCRegUnitIterator RUI(Reg, TRI); RUI.isValid(); ++RUI)
-    RegUnitsAvailable.reset(*RUI);
+void RegScavenger::setRegUsed(unsigned Reg, LaneBitmask LaneMask) {
+  for (MCRegUnitMaskIterator RUI(Reg, TRI); RUI.isValid(); ++RUI) {
+    LaneBitmask UnitMask = (*RUI).second;
+    if (UnitMask == 0 || (LaneMask & UnitMask) != 0)
+      RegUnitsAvailable.reset((*RUI).first);
+  }
 }
 
 void RegScavenger::initRegState() {
@@ -46,12 +49,9 @@ void RegScavenger::initRegState() {
   // All register units start out unused.
   RegUnitsAvailable.set();
 
-  if (!MBB)
-    return;
-
   // Live-in registers are in use.
-  for (unsigned LI : MBB->liveins())
-    setRegUsed(LI);
+  for (const auto &LI : MBB->liveins())
+    setRegUsed(LI.PhysReg, LI.LaneMask);
 
   // Pristine CSRs are also unavailable.
   const MachineFunction &MF = *MBB->getParent();
@@ -60,8 +60,8 @@ void RegScavenger::initRegState() {
     setRegUsed(I);
 }
 
-void RegScavenger::enterBasicBlock(MachineBasicBlock *mbb) {
-  MachineFunction &MF = *mbb->getParent();
+void RegScavenger::enterBasicBlock(MachineBasicBlock &MBB) {
+  MachineFunction &MF = *MBB.getParent();
   TII = MF.getSubtarget().getInstrInfo();
   TRI = MF.getSubtarget().getRegisterInfo();
   MRI = &MF.getRegInfo();
@@ -75,15 +75,15 @@ void RegScavenger::enterBasicBlock(MachineBasicBlock *mbb) {
          "Cannot use register scavenger with inaccurate liveness");
 
   // Self-initialize.
-  if (!MBB) {
+  if (!this->MBB) {
     NumRegUnits = TRI->getNumRegUnits();
     RegUnitsAvailable.resize(NumRegUnits);
     KillRegUnits.resize(NumRegUnits);
     DefRegUnits.resize(NumRegUnits);
     TmpRegUnits.resize(NumRegUnits);
   }
+  this->MBB = &MBB;
 
-  MBB = mbb;
   initRegState();
 
   Tracking = false;

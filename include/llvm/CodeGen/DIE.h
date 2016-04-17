@@ -100,10 +100,8 @@ public:
   ///
   void Emit(const AsmPrinter *AP) const;
 
-#ifndef NDEBUG
   void print(raw_ostream &O);
   void dump();
-#endif
 };
 
 //===--------------------------------------------------------------------===//
@@ -143,9 +141,7 @@ public:
   void EmitValue(const AsmPrinter *AP, dwarf::Form Form) const;
   unsigned SizeOf(const AsmPrinter *AP, dwarf::Form Form) const;
 
-#ifndef NDEBUG
   void print(raw_ostream &O) const;
-#endif
 };
 
 //===--------------------------------------------------------------------===//
@@ -164,9 +160,7 @@ public:
   void EmitValue(const AsmPrinter *AP, dwarf::Form Form) const;
   unsigned SizeOf(const AsmPrinter *AP, dwarf::Form Form) const;
 
-#ifndef NDEBUG
   void print(raw_ostream &O) const;
-#endif
 };
 
 //===--------------------------------------------------------------------===//
@@ -185,9 +179,7 @@ public:
   void EmitValue(const AsmPrinter *AP, dwarf::Form Form) const;
   unsigned SizeOf(const AsmPrinter *AP, dwarf::Form Form) const;
 
-#ifndef NDEBUG
   void print(raw_ostream &O) const;
-#endif
 };
 
 //===--------------------------------------------------------------------===//
@@ -203,9 +195,7 @@ public:
   void EmitValue(const AsmPrinter *AP, dwarf::Form Form) const;
   unsigned SizeOf(const AsmPrinter *AP, dwarf::Form Form) const;
 
-#ifndef NDEBUG
   void print(raw_ostream &O) const;
-#endif
 };
 
 //===--------------------------------------------------------------------===//
@@ -223,9 +213,7 @@ public:
   void EmitValue(const AsmPrinter *AP, dwarf::Form Form) const;
   unsigned SizeOf(const AsmPrinter *AP, dwarf::Form Form) const;
 
-#ifndef NDEBUG
   void print(raw_ostream &O) const;
-#endif
 };
 
 //===--------------------------------------------------------------------===//
@@ -252,30 +240,7 @@ public:
                                            : sizeof(int32_t);
   }
 
-#ifndef NDEBUG
   void print(raw_ostream &O) const;
-#endif
-};
-
-//===--------------------------------------------------------------------===//
-/// \brief A signature reference to a type unit.
-class DIETypeSignature {
-  const DwarfTypeUnit *Unit;
-
-  DIETypeSignature() = delete;
-
-public:
-  explicit DIETypeSignature(const DwarfTypeUnit &Unit) : Unit(&Unit) {}
-
-  void EmitValue(const AsmPrinter *AP, dwarf::Form Form) const;
-  unsigned SizeOf(const AsmPrinter *AP, dwarf::Form Form) const {
-    assert(Form == dwarf::DW_FORM_ref_sig8);
-    return 8;
-  }
-
-#ifndef NDEBUG
-  void print(raw_ostream &O) const;
-#endif
 };
 
 //===--------------------------------------------------------------------===//
@@ -295,9 +260,7 @@ public:
   void EmitValue(const AsmPrinter *AP, dwarf::Form Form) const;
   unsigned SizeOf(const AsmPrinter *AP, dwarf::Form Form) const;
 
-#ifndef NDEBUG
   void print(raw_ostream &O) const;
-#endif
 };
 
 //===--------------------------------------------------------------------===//
@@ -326,8 +289,9 @@ private:
   /// All values that aren't standard layout (or are larger than 8 bytes)
   /// should be stored by reference instead of by value.
   typedef AlignedCharArrayUnion<DIEInteger, DIEString, DIEExpr, DIELabel,
-                                DIEDelta *, DIEEntry, DIETypeSignature,
-                                DIEBlock *, DIELoc *, DIELocList> ValTy;
+                                DIEDelta *, DIEEntry, DIEBlock *, DIELoc *,
+                                DIELocList>
+      ValTy;
   static_assert(sizeof(ValTy) <= sizeof(uint64_t) ||
                     sizeof(ValTy) <= sizeof(void *),
                 "Expected all large types to be stored via pointer");
@@ -444,10 +408,8 @@ public:
   ///
   unsigned SizeOf(const AsmPrinter *AP) const;
 
-#ifndef NDEBUG
   void print(raw_ostream &O) const;
   void dump() const;
-#endif
 };
 
 struct IntrusiveBackListNode {
@@ -710,10 +672,8 @@ public:
   /// gives \a DIEValue::isNone) if no such attribute exists.
   DIEValue findAttribute(dwarf::Attribute Attribute) const;
 
-#ifndef NDEBUG
   void print(raw_ostream &O, unsigned IndentCount = 0) const;
   void dump();
-#endif
 };
 
 //===--------------------------------------------------------------------===//
@@ -747,9 +707,7 @@ public:
   void EmitValue(const AsmPrinter *AP, dwarf::Form Form) const;
   unsigned SizeOf(const AsmPrinter *AP, dwarf::Form Form) const;
 
-#ifndef NDEBUG
   void print(raw_ostream &O) const;
-#endif
 };
 
 //===--------------------------------------------------------------------===//
@@ -780,9 +738,7 @@ public:
   void EmitValue(const AsmPrinter *AP, dwarf::Form Form) const;
   unsigned SizeOf(const AsmPrinter *AP, dwarf::Form Form) const;
 
-#ifndef NDEBUG
   void print(raw_ostream &O) const;
-#endif
 };
 
 } // end llvm namespace

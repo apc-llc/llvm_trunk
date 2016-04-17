@@ -125,6 +125,20 @@ namespace llvm {
     bool isLegalAddressingMode(const DataLayout &DL, const AddrMode &AM,
                                Type *Ty, unsigned AS) const override;
 
+    /// If a physical register, this returns the register that receives the
+    /// exception address on entry to an EH pad.
+    unsigned
+    getExceptionPointerRegister(const Constant *PersonalityFn) const override {
+      return XCore::R0;
+    }
+
+    /// If a physical register, this returns the register that receives the
+    /// exception typeid on entry to a landing pad.
+    unsigned
+    getExceptionSelectorRegister(const Constant *PersonalityFn) const override {
+      return XCore::R1;
+    }
+
   private:
     const TargetMachine &TM;
     const XCoreSubtarget &Subtarget;
@@ -215,6 +229,9 @@ namespace llvm {
                      bool isVarArg,
                      const SmallVectorImpl<ISD::OutputArg> &ArgsFlags,
                      LLVMContext &Context) const override;
+    bool shouldInsertFencesForAtomic(const Instruction *I) const override {
+      return true;
+    }
   };
 }
 

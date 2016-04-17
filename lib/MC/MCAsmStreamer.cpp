@@ -1,4 +1,4 @@
-//===- lib/MC/MCAsmStreamer.cpp - Text Assembly Output --------------------===//
+//===- lib/MC/MCAsmStreamer.cpp - Text Assembly Output ----------*- C++ -*-===//
 //
 //                     The LLVM Compiler Infrastructure
 //
@@ -29,9 +29,11 @@
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/Format.h"
 #include "llvm/Support/FormattedStream.h"
+#include "llvm/Support/LEB128.h"
 #include "llvm/Support/MathExtras.h"
 #include "llvm/Support/Path.h"
 #include <cctype>
+
 using namespace llvm;
 
 namespace {
@@ -163,7 +165,7 @@ public:
   void EmitBytes(StringRef Data) override;
 
   void EmitValueImpl(const MCExpr *Value, unsigned Size,
-                     const SMLoc &Loc = SMLoc()) override;
+                     SMLoc Loc = SMLoc()) override;
   void EmitIntValue(uint64_t Value, unsigned Size) override;
 
   void EmitULEB128Value(const MCExpr *Value) override;
@@ -184,7 +186,7 @@ public:
   void EmitCodeAlignment(unsigned ByteAlignment,
                          unsigned MaxBytesToEmit = 0) override;
 
-  bool EmitValueToOffset(const MCExpr *Offset,
+  void emitValueToOffset(const MCExpr *Offset,
                          unsigned char Value = 0) override;
 
   void EmitFileDirective(StringRef Filename) override;
@@ -196,6 +198,22 @@ public:
                              unsigned Isa, unsigned Discriminator,
                              StringRef FileName) override;
   MCSymbol *getDwarfLineTableSymbol(unsigned CUID) override;
+
+  unsigned EmitCVFileDirective(unsigned FileNo, StringRef Filename) override;
+  void EmitCVLocDirective(unsigned FunctionId, unsigned FileNo, unsigned Line,
+                          unsigned Column, bool PrologueEnd, bool IsStmt,
+                          StringRef FileName) override;
+  void EmitCVLinetableDirective(unsigned FunctionId, const MCSymbol *FnStart,
+                                const MCSymbol *FnEnd) override;
+  void EmitCVInlineLinetableDirective(
+      unsigned PrimaryFunctionId, unsigned SourceFileId, unsigned SourceLineNum,
+      const MCSymbol *FnStartSym, const MCSymbol *FnEndSym,
+      ArrayRef<unsigned> SecondaryFunctionIds) override;
+  void EmitCVDefRangeDirective(
+      ArrayRef<std::pair<const MCSymbol *, const MCSymbol *>> Ranges,
+      StringRef FixedSizePortion) override;
+  void EmitCVStringTableDirective() override;
+  void EmitCVFileChecksumsDirective() override;
 
   void EmitIdent(StringRef IdentString) override;
   void EmitCFISections(bool EH, bool Debug) override;
@@ -210,6 +228,8 @@ public:
   void EmitCFISameValue(int64_t Register) override;
   void EmitCFIRelOffset(int64_t Register, int64_t Offset) override;
   void EmitCFIAdjustCfaOffset(int64_t Adjustment) override;
+  void EmitCFIEscape(StringRef Values) override;
+  void EmitCFIGnuArgsSize(int64_t Size) override;
   void EmitCFISignalFrame() override;
   void EmitCFIUndefined(int64_t Register) override;
   void EmitCFIRegister(int64_t Register1, int64_t Register2) override;
@@ -235,6 +255,9 @@ public:
   void EmitBundleAlignMode(unsigned AlignPow2) override;
   void EmitBundleLock(bool AlignToEnd) override;
   void EmitBundleUnlock() override;
+
+  bool EmitRelocDirective(const MCExpr &Offset, StringRef Name,
+                          const MCExpr *Expr, SMLoc Loc) override;
 
   /// EmitRawText - If this file is backed by an assembly streamer, this dumps
   /// the specified string in the output .s file.  This capability is
@@ -366,6 +389,8 @@ void MCAsmStreamer::EmitDataRegion(MCDataRegionType Kind) {
 void MCAsmStreamer::EmitVersionMin(MCVersionMinType Kind, unsigned Major,
                                    unsigned Minor, unsigned Update) {
   switch (Kind) {
+  case MCVM_WatchOSVersionMin:    OS << "\t.watchos_version_min"; break;
+  case MCVM_TvOSVersionMin:       OS << "\t.tvos_version_min"; break;
   case MCVM_IOSVersionMin:        OS << "\t.ios_version_min"; break;
   case MCVM_OSXVersionMin:        OS << "\t.macosx_version_min"; break;
   }
@@ -447,6 +472,7 @@ bool MCAsmStreamer::EmitSymbolAttribute(MCSymbol *Symbol,
     OS << "\t.no_dead_strip\t";
     break;
   case MCSA_SymbolResolver: OS << "\t.symbol_resolver\t"; break;
+  case MCSA_AltEntry:       OS << "\t.alt_entry\t";       break;
   case MCSA_PrivateExtern:
     OS << "\t.private_extern\t";
     break;
@@ -533,9 +559,6 @@ void MCAsmStreamer::emitELFSize(MCSymbolELF *Symbol, const MCExpr *Value) {
 
 void MCAsmStreamer::EmitCommonSymbol(MCSymbol *Symbol, uint64_t Size,
                                      unsigned ByteAlignment) {
-  // Common symbols do not belong to any actual section.
-  AssignSection(Symbol, nullptr);
-
   OS << "\t.comm\t";
   Symbol->print(OS, MAI);
   OS << ',' << Size;
@@ -555,9 +578,6 @@ void MCAsmStreamer::EmitCommonSymbol(MCSymbol *Symbol, uint64_t Size,
 /// @param Size - The size of the common symbol.
 void MCAsmStreamer::EmitLocalCommonSymbol(MCSymbol *Symbol, uint64_t Size,
                                           unsigned ByteAlign) {
-  // Common symbols do not belong to any actual section.
-  AssignSection(Symbol, nullptr);
-
   OS << "\t.lcomm\t";
   Symbol->print(OS, MAI);
   OS << ',' << Size;
@@ -581,7 +601,7 @@ void MCAsmStreamer::EmitLocalCommonSymbol(MCSymbol *Symbol, uint64_t Size,
 void MCAsmStreamer::EmitZerofill(MCSection *Section, MCSymbol *Symbol,
                                  uint64_t Size, unsigned ByteAlignment) {
   if (Symbol)
-    AssignSection(Symbol, Section);
+    AssignFragment(Symbol, &Section->getDummyFragment());
 
   // Note: a .zerofill directive does not switch sections.
   OS << ".zerofill ";
@@ -605,7 +625,7 @@ void MCAsmStreamer::EmitZerofill(MCSection *Section, MCSymbol *Symbol,
 // e.g. _a.
 void MCAsmStreamer::EmitTBSSSymbol(MCSection *Section, MCSymbol *Symbol,
                                    uint64_t Size, unsigned ByteAlignment) {
-  AssignSection(Symbol, Section);
+  AssignFragment(Symbol, &Section->getDummyFragment());
 
   assert(Symbol && "Symbol shouldn't be NULL!");
   // Instead of using the Section we'll just use the shortcut.
@@ -656,7 +676,6 @@ static void PrintQuotedString(StringRef Data, raw_ostream &OS) {
   OS << '"';
 }
 
-
 void MCAsmStreamer::EmitBytes(StringRef Data) {
   assert(getCurrentSection().first &&
          "Cannot emit contents before setting section!");
@@ -687,7 +706,7 @@ void MCAsmStreamer::EmitIntValue(uint64_t Value, unsigned Size) {
 }
 
 void MCAsmStreamer::EmitValueImpl(const MCExpr *Value, unsigned Size,
-                                  const SMLoc &Loc) {
+                                  SMLoc Loc) {
   assert(Size <= 8 && "Invalid size");
   assert(getCurrentSection().first &&
          "Cannot emit contents before setting section!");
@@ -706,17 +725,15 @@ void MCAsmStreamer::EmitValueImpl(const MCExpr *Value, unsigned Size,
       report_fatal_error("Don't know how to emit this value.");
 
     // We couldn't handle the requested integer size so we fallback by breaking
-    // the request down into several, smaller, integers.  Since sizes greater
-    // than eight are invalid and size equivalent to eight should have been
-    // handled earlier, we use four bytes as our largest piece of granularity.
+    // the request down into several, smaller, integers.
+    // Since sizes greater or equal to "Size" are invalid, we use the greatest
+    // power of 2 that is less than "Size" as our largest piece of granularity.
     bool IsLittleEndian = MAI->isLittleEndian();
     for (unsigned Emitted = 0; Emitted != Size;) {
       unsigned Remaining = Size - Emitted;
       // The size of our partial emission must be a power of two less than
-      // eight.
-      unsigned EmissionSize = PowerOf2Floor(Remaining);
-      if (EmissionSize > 4)
-        EmissionSize = 4;
+      // Size.
+      unsigned EmissionSize = PowerOf2Floor(std::min(Remaining, Size - 1));
       // Calculate the byte offset of our partial emission taking into account
       // the endianness of the target.
       unsigned ByteOffset =
@@ -778,7 +795,6 @@ void MCAsmStreamer::EmitGPRel32Value(const MCExpr *Value) {
   EmitEOL();
 }
 
-
 /// EmitFill - Emit NumBytes bytes worth of the value specified by
 /// FillValue.  This implements directives such as '.space'.
 void MCAsmStreamer::EmitFill(uint64_t NumBytes, uint8_t FillValue) {
@@ -806,7 +822,7 @@ void MCAsmStreamer::EmitValueToAlignment(unsigned ByteAlignment, int64_t Value,
     default:
       llvm_unreachable("Invalid size for machine code value!");
     case 1:
-      OS << "\t.align\t";
+      OS << "\t.p2align\t";
       break;
     case 2:
       OS << ".p2alignw ";
@@ -818,10 +834,7 @@ void MCAsmStreamer::EmitValueToAlignment(unsigned ByteAlignment, int64_t Value,
       llvm_unreachable("Unsupported alignment size!");
     }
 
-    if (MAI->getAlignmentIsInBytes())
-      OS << ByteAlignment;
-    else
-      OS << Log2_32(ByteAlignment);
+    OS << Log2_32(ByteAlignment);
 
     if (Value || MaxBytesToEmit) {
       OS << ", 0x";
@@ -858,16 +871,14 @@ void MCAsmStreamer::EmitCodeAlignment(unsigned ByteAlignment,
                        1, MaxBytesToEmit);
 }
 
-bool MCAsmStreamer::EmitValueToOffset(const MCExpr *Offset,
+void MCAsmStreamer::emitValueToOffset(const MCExpr *Offset,
                                       unsigned char Value) {
   // FIXME: Verify that Offset is associated with the current section.
   OS << ".org ";
   Offset->print(OS, MAI);
   OS << ", " << (unsigned)Value;
   EmitEOL();
-  return false;
 }
-
 
 void MCAsmStreamer::EmitFileDirective(StringRef Filename) {
   assert(MAI->hasSingleParameterDotFile());
@@ -958,6 +969,105 @@ MCSymbol *MCAsmStreamer::getDwarfLineTableSymbol(unsigned CUID) {
   return MCStreamer::getDwarfLineTableSymbol(0);
 }
 
+unsigned MCAsmStreamer::EmitCVFileDirective(unsigned FileNo,
+                                            StringRef Filename) {
+  if (!getContext().getCVFile(Filename, FileNo))
+    return 0;
+
+  OS << "\t.cv_file\t" << FileNo << ' ';
+
+  PrintQuotedString(Filename, OS);
+  EmitEOL();
+
+  return FileNo;
+}
+
+void MCAsmStreamer::EmitCVLocDirective(unsigned FunctionId, unsigned FileNo,
+                                       unsigned Line, unsigned Column,
+                                       bool PrologueEnd, bool IsStmt,
+                                       StringRef FileName) {
+  OS << "\t.cv_loc\t" << FunctionId << " " << FileNo << " " << Line << " "
+     << Column;
+  if (PrologueEnd)
+    OS << " prologue_end";
+
+  unsigned OldIsStmt = getContext().getCurrentCVLoc().isStmt();
+  if (IsStmt != OldIsStmt) {
+    OS << " is_stmt ";
+
+    if (IsStmt)
+      OS << "1";
+    else
+      OS << "0";
+  }
+
+  if (IsVerboseAsm) {
+    OS.PadToColumn(MAI->getCommentColumn());
+    OS << MAI->getCommentString() << ' ' << FileName << ':'
+       << Line << ':' << Column;
+  }
+  EmitEOL();
+  this->MCStreamer::EmitCVLocDirective(FunctionId, FileNo, Line, Column,
+                                       PrologueEnd, IsStmt, FileName);
+}
+
+void MCAsmStreamer::EmitCVLinetableDirective(unsigned FunctionId,
+                                             const MCSymbol *FnStart,
+                                             const MCSymbol *FnEnd) {
+  OS << "\t.cv_linetable\t" << FunctionId << ", ";
+  FnStart->print(OS, MAI);
+  OS << ", ";
+  FnEnd->print(OS, MAI);
+  EmitEOL();
+  this->MCStreamer::EmitCVLinetableDirective(FunctionId, FnStart, FnEnd);
+}
+
+void MCAsmStreamer::EmitCVInlineLinetableDirective(
+    unsigned PrimaryFunctionId, unsigned SourceFileId, unsigned SourceLineNum,
+    const MCSymbol *FnStartSym, const MCSymbol *FnEndSym,
+    ArrayRef<unsigned> SecondaryFunctionIds) {
+  OS << "\t.cv_inline_linetable\t" << PrimaryFunctionId << ' ' << SourceFileId
+     << ' ' << SourceLineNum << ' ';
+  FnStartSym->print(OS, MAI);
+  OS << ' ';
+  FnEndSym->print(OS, MAI);
+  if (!SecondaryFunctionIds.empty()) {
+    OS << " contains";
+    for (unsigned SecondaryFunctionId : SecondaryFunctionIds)
+      OS << ' ' << SecondaryFunctionId;
+  }
+  EmitEOL();
+  this->MCStreamer::EmitCVInlineLinetableDirective(
+      PrimaryFunctionId, SourceFileId, SourceLineNum, FnStartSym, FnEndSym,
+      SecondaryFunctionIds);
+}
+
+void MCAsmStreamer::EmitCVDefRangeDirective(
+    ArrayRef<std::pair<const MCSymbol *, const MCSymbol *>> Ranges,
+    StringRef FixedSizePortion) {
+  OS << "\t.cv_def_range\t";
+  for (std::pair<const MCSymbol *, const MCSymbol *> Range : Ranges) {
+    OS << ' ';
+    Range.first->print(OS, MAI);
+    OS << ' ';
+    Range.second->print(OS, MAI);
+  }
+  OS << ", ";
+  PrintQuotedString(FixedSizePortion, OS);
+  EmitEOL();
+  this->MCStreamer::EmitCVDefRangeDirective(Ranges, FixedSizePortion);
+}
+
+void MCAsmStreamer::EmitCVStringTableDirective() {
+  OS << "\t.cv_stringtable";
+  EmitEOL();
+}
+
+void MCAsmStreamer::EmitCVFileChecksumsDirective() {
+  OS << "\t.cv_filechecksums";
+  EmitEOL();
+}
+
 void MCAsmStreamer::EmitIdent(StringRef IdentString) {
   assert(MAI->hasIdentDirective() && ".ident directive not supported");
   OS << "\t.ident\t";
@@ -1013,6 +1123,32 @@ void MCAsmStreamer::EmitCFIDefCfa(int64_t Register, int64_t Offset) {
 void MCAsmStreamer::EmitCFIDefCfaOffset(int64_t Offset) {
   MCStreamer::EmitCFIDefCfaOffset(Offset);
   OS << "\t.cfi_def_cfa_offset " << Offset;
+  EmitEOL();
+}
+
+static void PrintCFIEscape(llvm::formatted_raw_ostream &OS, StringRef Values) {
+  OS << "\t.cfi_escape ";
+  if (!Values.empty()) {
+    size_t e = Values.size() - 1;
+    for (size_t i = 0; i < e; ++i)
+      OS << format("0x%02x", uint8_t(Values[i])) << ", ";
+    OS << format("0x%02x", uint8_t(Values[e]));
+  }
+}
+
+void MCAsmStreamer::EmitCFIEscape(StringRef Values) {
+  MCStreamer::EmitCFIEscape(Values);
+  PrintCFIEscape(OS, Values);
+  EmitEOL();
+}
+
+void MCAsmStreamer::EmitCFIGnuArgsSize(int64_t Size) {
+  MCStreamer::EmitCFIGnuArgsSize(Size);
+  
+  uint8_t Buffer[16] = { dwarf::DW_CFA_GNU_args_size };
+  unsigned Len = encodeULEB128(Size, Buffer + 1) + 1;
+  
+  PrintCFIEscape(OS, StringRef((const char *)&Buffer[0], Len));
   EmitEOL();
 }
 
@@ -1205,7 +1341,7 @@ void MCAsmStreamer::EmitWinCFIPushFrame(bool Code) {
   EmitEOL();
 }
 
-void MCAsmStreamer::EmitWinCFIEndProlog(void) {
+void MCAsmStreamer::EmitWinCFIEndProlog() {
   MCStreamer::EmitWinCFIEndProlog();
 
   OS << "\t.seh_endprologue";
@@ -1333,6 +1469,19 @@ void MCAsmStreamer::EmitBundleLock(bool AlignToEnd) {
 void MCAsmStreamer::EmitBundleUnlock() {
   OS << "\t.bundle_unlock";
   EmitEOL();
+}
+
+bool MCAsmStreamer::EmitRelocDirective(const MCExpr &Offset, StringRef Name,
+                                       const MCExpr *Expr, SMLoc) {
+  OS << "\t.reloc ";
+  Offset.print(OS, MAI);
+  OS << ", " << Name;
+  if (Expr) {
+    OS << ", ";
+    Expr->print(OS, MAI);
+  }
+  EmitEOL();
+  return false;
 }
 
 /// EmitRawText - If this file is backed by an assembly streamer, this dumps

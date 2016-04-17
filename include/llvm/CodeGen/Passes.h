@@ -170,7 +170,8 @@ public:
   void substitutePass(AnalysisID StandardID, IdentifyingPassPtr TargetID);
 
   /// Insert InsertedPassID pass after TargetPassID pass.
-  void insertPass(AnalysisID TargetPassID, IdentifyingPassPtr InsertedPassID);
+  void insertPass(AnalysisID TargetPassID, IdentifyingPassPtr InsertedPassID,
+                  bool VerifyAfter = true, bool PrintAfter = true);
 
   /// Allow the target to enable a specific standard pass by default.
   void enablePass(AnalysisID PassID) { substitutePass(PassID, PassID); }
@@ -215,6 +216,19 @@ public:
     return true;
   }
 
+  /// This method should install an IR translator pass, which converts from
+  /// LLVM code to machine instructions with possibly generic opcodes.
+  virtual bool addIRTranslator() { return true; }
+
+  /// This method may be implemented by targets that want to run passes
+  /// immediately before the register bank selection.
+  virtual void addPreRegBankSelect() {}
+
+  /// This method should install a register bank selector pass, which
+  /// assigns register banks to virtual registers without a register
+  /// class or register banks.
+  virtual bool addRegBankSelect() { return true; }
+
   /// Add the complete, standard set of LLVM CodeGen passes.
   /// Fully developed targets will not generally override this.
   virtual void addMachinePasses();
@@ -225,7 +239,7 @@ public:
   ///
   /// This can also be used to plug a new MachineSchedStrategy into an instance
   /// of the standard ScheduleDAGMI:
-  ///   return new ScheduleDAGMI(C, make_unique<MyStrategy>(C), /* IsPostRA= */false)
+  ///   return new ScheduleDAGMI(C, make_unique<MyStrategy>(C), /*RemoveKillFlags=*/false)
   ///
   /// Return NULL to select the default (generic) machine scheduler.
   virtual ScheduleDAGInstrs *
@@ -582,6 +596,9 @@ namespace llvm {
   /// StackSlotColoring - This pass performs stack slot coloring.
   extern char &StackSlotColoringID;
 
+  /// \brief This pass lays out funclets contiguously.
+  extern char &FuncletLayoutID;
+
   /// createStackProtectorPass - This pass adds stack protectors to functions.
   ///
   FunctionPass *createStackProtectorPass(const TargetMachine *TM);
@@ -636,6 +653,9 @@ namespace llvm {
   /// the intrinsic for later emission to the StackMap.
   extern char &StackMapLivenessID;
 
+  /// LiveDebugValues pass
+  extern char &LiveDebugValuesID;
+
   /// createJumpInstrTables - This pass creates jump-instruction tables.
   ModulePass *createJumpInstrTablesPass();
 
@@ -647,6 +667,23 @@ namespace llvm {
   /// memory accesses to target specific intrinsics.
   ///
   FunctionPass *createInterleavedAccessPass(const TargetMachine *TM);
+
+  /// LowerEmuTLS - This pass generates __emutls_[vt].xyz variables for all
+  /// TLS variables for the emulated TLS model.
+  ///
+  ModulePass *createLowerEmuTLSPass(const TargetMachine *TM);
+
+  /// GlobalMerge - This pass merges internal (by default) globals into structs
+  /// to enable reuse of a base pointer by indexed addressing modes.
+  /// It can also be configured to focus on size optimizations only.
+  ///
+  Pass *createGlobalMergePass(const TargetMachine *TM, unsigned MaximalOffset,
+                              bool OnlyOptimizeForSize = false,
+                              bool MergeExternalByDefault = false);
+
+  /// This pass splits the stack into a safe stack and an unsafe stack to
+  /// protect against stack-based overflow vulnerabilities.
+  FunctionPass *createSafeStackPass(const TargetMachine *TM = nullptr);
 } // End llvm namespace
 
 /// Target machine pass initializer for passes with dependencies. Use with

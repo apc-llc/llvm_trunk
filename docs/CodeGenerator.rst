@@ -45,7 +45,7 @@ components:
    ``include/llvm/CodeGen/``. At this level, concepts like "constant pool
    entries" and "jump tables" are explicitly exposed.
 
-3. Classes and algorithms used to represent code as the object file level, the
+3. Classes and algorithms used to represent code at the object file level, the
    `MC Layer`_.  These classes represent assembly level constructs like labels,
    sections, and instructions.  At this level, concepts like "constant pool
    entries" and "jump tables" don't exist.
@@ -632,7 +632,7 @@ directives through MCStreamer.
 
 On the implementation side of MCStreamer, there are two major implementations:
 one for writing out a .s file (MCAsmStreamer), and one for writing out a .o
-file (MCObjectStreamer).  MCAsmStreamer is a straight-forward implementation
+file (MCObjectStreamer).  MCAsmStreamer is a straightforward implementation
 that prints out a directive for each method (e.g. ``EmitValue -> .byte``), but
 MCObjectStreamer implements a full assembler.
 
@@ -640,7 +640,7 @@ For target specific directives, the MCStreamer has a MCTargetStreamer instance.
 Each target that needs it defines a class that inherits from it and is a lot
 like MCStreamer itself: It has one method per directive and two classes that
 inherit from it, a target object streamer and a target asm streamer. The target
-asm streamer just prints it (``emitFnStart -> .fnstrart``), and the object
+asm streamer just prints it (``emitFnStart -> .fnstart``), and the object
 streamer implement the assembler logic for it.
 
 To make llvm use these classes, the target initialization must call

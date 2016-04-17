@@ -1,4 +1,4 @@
-//===-- llvm-mc.cpp - Machine Code Hacking Driver -------------------------===//
+//===-- llvm-mc.cpp - Machine Code Hacking Driver ---------------*- C++ -*-===//
 //
 //                     The LLVM Compiler Infrastructure
 //
@@ -20,11 +20,11 @@
 #include "llvm/MC/MCInstrInfo.h"
 #include "llvm/MC/MCObjectFileInfo.h"
 #include "llvm/MC/MCParser/AsmLexer.h"
+#include "llvm/MC/MCParser/MCTargetAsmParser.h"
 #include "llvm/MC/MCRegisterInfo.h"
 #include "llvm/MC/MCSectionMachO.h"
 #include "llvm/MC/MCStreamer.h"
 #include "llvm/MC/MCSubtargetInfo.h"
-#include "llvm/MC/MCTargetAsmParser.h"
 #include "llvm/MC/MCTargetOptionsCommandFlags.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Compression.h"
@@ -39,6 +39,7 @@
 #include "llvm/Support/TargetRegistry.h"
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/ToolOutputFile.h"
+
 using namespace llvm;
 
 static cl::opt<std::string>
@@ -234,7 +235,7 @@ static void setDwarfDebugFlags(int argc, char **argv) {
 }
 
 static std::string DwarfDebugProducer;
-static void setDwarfDebugProducer(void) {
+static void setDwarfDebugProducer() {
   if(!getenv("DEBUG_PRODUCER"))
     return;
   DwarfDebugProducer += getenv("DEBUG_PRODUCER");
@@ -398,7 +399,7 @@ int main(int argc, char **argv) {
   ErrorOr<std::unique_ptr<MemoryBuffer>> BufferPtr =
       MemoryBuffer::getFileOrSTDIN(InputFilename);
   if (std::error_code EC = BufferPtr.getError()) {
-    errs() << ProgName << ": " << EC.message() << '\n';
+    errs() << InputFilename << ": " << EC.message() << '\n';
     return 1;
   }
   MemoryBuffer *Buffer = BufferPtr->get();
@@ -451,6 +452,12 @@ int main(int argc, char **argv) {
     Ctx.setDwarfDebugProducer(StringRef(DwarfDebugProducer));
   if (!DebugCompilationDir.empty())
     Ctx.setCompilationDir(DebugCompilationDir);
+  else {
+    // If no compilation dir is set, try to use the current directory.
+    SmallString<128> CWD;
+    if (!sys::fs::current_path(CWD))
+      Ctx.setCompilationDir(CWD);
+  }
   if (!MainFileName.empty())
     Ctx.setMainFileName(MainFileName);
 
@@ -510,9 +517,10 @@ int main(int argc, char **argv) {
 
     MCCodeEmitter *CE = TheTarget->createMCCodeEmitter(*MCII, *MRI, Ctx);
     MCAsmBackend *MAB = TheTarget->createMCAsmBackend(*MRI, TripleName, MCPU);
-    Str.reset(TheTarget->createMCObjectStreamer(TheTriple, Ctx, *MAB, *OS, CE,
-                                                *STI, RelaxAll,
-                                                /*DWARFMustBeAtTheEnd*/ false));
+    Str.reset(TheTarget->createMCObjectStreamer(
+        TheTriple, Ctx, *MAB, *OS, CE, *STI, MCOptions.MCRelaxAll,
+        MCOptions.MCIncrementalLinkerCompatible,
+        /*DWARFMustBeAtTheEnd*/ false));
     if (NoExecStack)
       Str->InitSections(true);
   }

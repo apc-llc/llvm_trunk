@@ -113,6 +113,11 @@ RUN:   FileCheck --check-prefix=ELEMENT-TYPE %s
 
 ELEMENT-TYPE: Invalid type
 
+RUN: not llvm-dis -disable-output %p/Inputs/invalid-cast.bc 2>&1 | \
+RUN:   FileCheck --check-prefix=INVALID-CAST %s
+
+INVALID-CAST: Invalid cast
+
 RUN: not llvm-dis -disable-output %p/Inputs/invalid-array-op-not-2nd-to-last.bc 2>&1 | \
 RUN:   FileCheck --check-prefix=ARRAY-NOT-2LAST %s
 
@@ -163,11 +168,6 @@ RUN:   FileCheck --check-prefix=INVALID-ARGUMENT-TYPE %s
 
 INVALID-ARGUMENT-TYPE: Invalid function argument type
 
-RUN: not llvm-dis -disable-output %p/Inputs/invalid-fixme-streaming-blob.bc 2>&1 | \
-RUN:   FileCheck --check-prefix=STREAMING-BLOB %s
-
-STREAMING-BLOB: getPointer in streaming memory objects not allowed
-
 RUN: not llvm-dis -disable-output %p/Inputs/invalid-function-comdat-id.bc 2>&1 | \
 RUN:   FileCheck --check-prefix=INVALID-FCOMDAT-ID %s
 
@@ -202,3 +202,13 @@ RUN: not llvm-dis -disable-output %p/Inputs/invalid-alias-type-mismatch.bc 2>&1 
 RUN:   FileCheck --check-prefix=ALIAS-TYPE-MISMATCH %s
 
 ALIAS-TYPE-MISMATCH: Alias and aliasee types don't match
+
+RUN: not llvm-dis -disable-output %p/Inputs/invalid-no-function-block.bc 2>&1 | \
+RUN:   FileCheck --check-prefix=NO-FUNCTION-BLOCK %s
+
+NO-FUNCTION-BLOCK: Trying to materialize functions before seeing function blocks
+
+RUN: not llvm-dis -disable-output %p/Inputs/invalid-name-with-0-byte.bc 2>&1 | \
+RUN:   FileCheck --check-prefix=NAME-WITH-0 %s
+
+NAME-WITH-0: Invalid value name

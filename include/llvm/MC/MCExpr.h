@@ -20,6 +20,7 @@ class MCAsmLayout;
 class MCAssembler;
 class MCContext;
 class MCFixup;
+class MCFragment;
 class MCSection;
 class MCStreamer;
 class MCSymbol;
@@ -115,7 +116,7 @@ public:
   /// currently defined as the absolute section for constants, or
   /// otherwise the section associated with the first defined symbol in the
   /// expression.
-  MCSection *findAssociatedSection() const;
+  MCFragment *findAssociatedFragment() const;
 
   /// @}
 };
@@ -164,6 +165,7 @@ public:
 
     VK_GOT,
     VK_GOTOFF,
+    VK_GOTREL,
     VK_GOTPCREL,
     VK_GOTTPOFF,
     VK_INDNTPOFF,
@@ -175,6 +177,8 @@ public:
     VK_TLSLDM,
     VK_TPOFF,
     VK_DTPOFF,
+    VK_TLSCALL,   // symbol(tlscall)
+    VK_TLSDESC,   // symbol(tlsdesc)
     VK_TLVP,      // Mach-O thread local variable relocations
     VK_TLVPPAGE,
     VK_TLVPPAGEOFF,
@@ -187,13 +191,12 @@ public:
     VK_WEAKREF,   // The link between the symbols in .weakref foo, bar
 
     VK_ARM_NONE,
+    VK_ARM_GOT_PREL,
     VK_ARM_TARGET1,
     VK_ARM_TARGET2,
     VK_ARM_PREL31,
     VK_ARM_SBREL,          // symbol(sbrel)
     VK_ARM_TLSLDO,         // symbol(tlsldo)
-    VK_ARM_TLSCALL,        // symbol(tlscall)
-    VK_ARM_TLSDESC,        // symbol(tlsdesc)
     VK_ARM_TLSDESCSEQ,
 
     VK_PPC_LO,             // symbol@l
@@ -212,7 +215,6 @@ public:
     VK_PPC_TOC_HI,         // symbol@toc@h
     VK_PPC_TOC_HA,         // symbol@toc@ha
     VK_PPC_DTPMOD,         // symbol@dtpmod
-    VK_PPC_TPREL,          // symbol@tprel
     VK_PPC_TPREL_LO,       // symbol@tprel@l
     VK_PPC_TPREL_HI,       // symbol@tprel@h
     VK_PPC_TPREL_HA,       // symbol@tprel@ha
@@ -220,7 +222,6 @@ public:
     VK_PPC_TPREL_HIGHERA,  // symbol@tprel@highera
     VK_PPC_TPREL_HIGHEST,  // symbol@tprel@highest
     VK_PPC_TPREL_HIGHESTA, // symbol@tprel@highesta
-    VK_PPC_DTPREL,         // symbol@dtprel
     VK_PPC_DTPREL_LO,      // symbol@dtprel@l
     VK_PPC_DTPREL_HI,      // symbol@dtprel@h
     VK_PPC_DTPREL_HA,      // symbol@dtprel@ha
@@ -288,6 +289,9 @@ public:
     VK_Hexagon_LD_PLT,
     VK_Hexagon_IE,
     VK_Hexagon_IE_GOT,
+
+    VK_WebAssembly_FUNCTION, // Function table index, rather than virtual addr
+
     VK_TPREL,
     VK_DTPREL
   };
@@ -556,7 +560,7 @@ public:
                                          const MCAsmLayout *Layout,
                                          const MCFixup *Fixup) const = 0;
   virtual void visitUsedExpr(MCStreamer& Streamer) const = 0;
-  virtual MCSection *findAssociatedSection() const = 0;
+  virtual MCFragment *findAssociatedFragment() const = 0;
 
   virtual void fixELFSymbolsInTLSFixups(MCAssembler &) const = 0;
 

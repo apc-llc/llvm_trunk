@@ -437,7 +437,7 @@ std::string CppWriter::getCppName(const Value* val) {
 
   if (const GlobalVariable* GV = dyn_cast<GlobalVariable>(val)) {
     name = std::string("gvar_") +
-      getTypePrefix(GV->getType()->getElementType());
+      getTypePrefix(GV->getValueType());
   } else if (isa<Function>(val)) {
     name = std::string("func_");
   } else if (const Constant* C = dyn_cast<Constant>(val)) {
@@ -997,13 +997,13 @@ void CppWriter::printVariableHead(const GlobalVariable *GV) {
   if (is_inline) {
     Out << " = mod->getGlobalVariable(mod->getContext(), ";
     printEscapedString(GV->getName());
-    Out << ", " << getCppName(GV->getType()->getElementType()) << ",true)";
+    Out << ", " << getCppName(GV->getValueType()) << ",true)";
     nl(Out) << "if (!" << getCppName(GV) << ") {";
     in(); nl(Out) << getCppName(GV);
   }
   Out << " = new GlobalVariable(/*Module=*/*mod, ";
   nl(Out) << "/*Type=*/";
-  printCppName(GV->getType()->getElementType());
+  printCppName(GV->getValueType());
   Out << ",";
   nl(Out) << "/*isConstant=*/" << (GV->isConstant()?"true":"false");
   Out << ",";
@@ -1091,13 +1091,14 @@ std::string CppWriter::getOpName(const Value* V) {
 
 static StringRef ConvertAtomicOrdering(AtomicOrdering Ordering) {
   switch (Ordering) {
-    case NotAtomic: return "NotAtomic";
-    case Unordered: return "Unordered";
-    case Monotonic: return "Monotonic";
-    case Acquire: return "Acquire";
-    case Release: return "Release";
-    case AcquireRelease: return "AcquireRelease";
-    case SequentiallyConsistent: return "SequentiallyConsistent";
+    case AtomicOrdering::NotAtomic: return "NotAtomic";
+    case AtomicOrdering::Unordered: return "Unordered";
+    case AtomicOrdering::Monotonic: return "Monotonic";
+    case AtomicOrdering::Acquire: return "Acquire";
+    case AtomicOrdering::Release: return "Release";
+    case AtomicOrdering::AcquireRelease: return "AcquireRelease";
+    case AtomicOrdering::SequentiallyConsistent:
+      return "SequentiallyConsistent";
   }
   llvm_unreachable("Unknown ordering");
 }
@@ -1356,23 +1357,18 @@ void CppWriter::printInstruction(const Instruction *I,
   }
   case Instruction::GetElementPtr: {
     const GetElementPtrInst* gep = cast<GetElementPtrInst>(I);
-    if (gep->getNumOperands() <= 2) {
-      Out << "GetElementPtrInst* " << iName << " = GetElementPtrInst::Create("
-          << opNames[0];
-      if (gep->getNumOperands() == 2)
-        Out << ", " << opNames[1];
-    } else {
-      Out << "std::vector<Value*> " << iName << "_indices;";
-      nl(Out);
-      for (unsigned i = 1; i < gep->getNumOperands(); ++i ) {
-        Out << iName << "_indices.push_back("
-            << opNames[i] << ");";
-        nl(Out);
+    Out << "GetElementPtrInst* " << iName << " = GetElementPtrInst::Create("
+        << getCppName(gep->getSourceElementType()) << ", " << opNames[0] << ", {";
+    in();
+    for (unsigned i = 1; i < gep->getNumOperands(); ++i ) {
+      if (i != 1) {
+        Out << ", ";
       }
-      Out << "Instruction* " << iName << " = GetElementPtrInst::Create("
-          << opNames[0] << ", " << iName << "_indices";
+      nl(Out);
+      Out << opNames[i];
     }
-    Out << ", \"";
+    out();
+    nl(Out) << "}, \"";
     printEscapedString(gep->getName());
     Out << "\", " << bbname << ");";
     break;
@@ -1656,8 +1652,8 @@ void CppWriter::printFunctionUses(const Function* F) {
 
   // Print type definitions for every type referenced by an instruction and
   // make a note of any global values or constants that are referenced
-  SmallPtrSet<GlobalValue*,64> gvs;
-  SmallPtrSet<Constant*,64> consts;
+  SmallPtrSet<GlobalValue*,32> gvs;
+  SmallPtrSet<Constant*,32> consts;
   for (Function::const_iterator BB = F->begin(), BE = F->end();
        BB != BE; ++BB){
     for (BasicBlock::const_iterator I = BB->begin(), E = BB->end();
@@ -1804,13 +1800,12 @@ void CppWriter::printFunctionBody(const Function *F) {
           << "->arg_begin();";
       nl(Out);
     }
-    for (Function::const_arg_iterator AI = F->arg_begin(), AE = F->arg_end();
-         AI != AE; ++AI) {
-      Out << "Value* " << getCppName(AI) << " = args++;";
+    for (const Argument &AI : F->args()) {
+      Out << "Value* " << getCppName(&AI) << " = args++;";
       nl(Out);
-      if (AI->hasName()) {
-        Out << getCppName(AI) << "->setName(\"";
-        printEscapedString(AI->getName());
+      if (AI.hasName()) {
+        Out << getCppName(&AI) << "->setName(\"";
+        printEscapedString(AI.getName());
         Out << "\");";
         nl(Out);
       }
@@ -1819,29 +1814,25 @@ void CppWriter::printFunctionBody(const Function *F) {
 
   // Create all the basic blocks
   nl(Out);
-  for (Function::const_iterator BI = F->begin(), BE = F->end();
-       BI != BE; ++BI) {
-    std::string bbname(getCppName(BI));
+  for (const BasicBlock &BI : *F) {
+    std::string bbname(getCppName(&BI));
     Out << "BasicBlock* " << bbname <<
            " = BasicBlock::Create(mod->getContext(), \"";
-    if (BI->hasName())
-      printEscapedString(BI->getName());
-    Out << "\"," << getCppName(BI->getParent()) << ",0);";
+    if (BI.hasName())
+      printEscapedString(BI.getName());
+    Out << "\"," << getCppName(BI.getParent()) << ",0);";
     nl(Out);
   }
 
   // Output all of its basic blocks... for the function
-  for (Function::const_iterator BI = F->begin(), BE = F->end();
-       BI != BE; ++BI) {
-    std::string bbname(getCppName(BI));
-    nl(Out) << "// Block " << BI->getName() << " (" << bbname << ")";
+  for (const BasicBlock &BI : *F) {
+    std::string bbname(getCppName(&BI));
+    nl(Out) << "// Block " << BI.getName() << " (" << bbname << ")";
     nl(Out);
 
     // Output all of the instructions in the basic block...
-    for (BasicBlock::const_iterator I = BI->begin(), E = BI->end();
-         I != E; ++I) {
-      printInstruction(I,bbname);
-    }
+    for (const Instruction &I : BI)
+      printInstruction(&I, bbname);
   }
 
   // Loop over the ForwardRefs and resolve them now that all instructions
@@ -1884,7 +1875,7 @@ void CppWriter::printInline(const std::string& fname,
   printFunctionUses(F);
   printFunctionBody(F);
   is_inline = false;
-  Out << "return " << getCppName(F->begin()) << ";";
+  Out << "return " << getCppName(&F->front()) << ";";
   nl(Out) << "}";
   nl(Out);
 }
@@ -1897,17 +1888,14 @@ void CppWriter::printModuleBody() {
   // Functions can call each other and global variables can reference them so
   // define all the functions first before emitting their function bodies.
   nl(Out) << "// Function Declarations"; nl(Out);
-  for (Module::const_iterator I = TheModule->begin(), E = TheModule->end();
-       I != E; ++I)
-    printFunctionHead(I);
+  for (const Function &I : *TheModule)
+    printFunctionHead(&I);
 
   // Process the global variables declarations. We can't initialze them until
   // after the constants are printed so just print a header for each global
   nl(Out) << "// Global Variable Declarations\n"; nl(Out);
-  for (Module::const_global_iterator I = TheModule->global_begin(),
-         E = TheModule->global_end(); I != E; ++I) {
-    printVariableHead(I);
-  }
+  for (const GlobalVariable &I : TheModule->globals())
+    printVariableHead(&I);
 
   // Print out all the constants definitions. Constants don't recurse except
   // through GlobalValues. All GlobalValues have been declared at this point
@@ -1919,21 +1907,18 @@ void CppWriter::printModuleBody() {
   // been emitted. These definitions just couple the gvars with their constant
   // initializers.
   nl(Out) << "// Global Variable Definitions"; nl(Out);
-  for (Module::const_global_iterator I = TheModule->global_begin(),
-         E = TheModule->global_end(); I != E; ++I) {
-    printVariableBody(I);
-  }
+  for (const GlobalVariable &I : TheModule->globals())
+    printVariableBody(&I);
 
   // Finally, we can safely put out all of the function bodies.
   nl(Out) << "// Function Definitions"; nl(Out);
-  for (Module::const_iterator I = TheModule->begin(), E = TheModule->end();
-       I != E; ++I) {
-    if (!I->isDeclaration()) {
-      nl(Out) << "// Function: " << I->getName() << " (" << getCppName(I)
+  for (const Function &I : *TheModule) {
+    if (!I.isDeclaration()) {
+      nl(Out) << "// Function: " << I.getName() << " (" << getCppName(&I)
               << ")";
       nl(Out) << "{";
       nl(Out,1);
-      printFunctionBody(I);
+      printFunctionBody(&I);
       nl(Out,-1) << "}";
       nl(Out);
     }
@@ -1962,6 +1947,7 @@ void CppWriter::printProgram(const std::string& fname,
   Out << "#include <llvm/Support/MathExtras.h>\n";
   Out << "#include <algorithm>\n";
   Out << "using namespace llvm;\n\n";
+  Out << "static LLVMContext TheContext;\n\n";
   Out << "Module* " << fname << "();\n\n";
   Out << "int main(int argc, char**argv) {\n";
   Out << "  Module* Mod = " << fname << "();\n";
@@ -1980,7 +1966,7 @@ void CppWriter::printModule(const std::string& fname,
   nl(Out,1) << "// Module Construction";
   nl(Out) << "Module* mod = new Module(\"";
   printEscapedString(mName);
-  Out << "\", getGlobalContext());";
+  Out << "\", TheContext);";
   if (!TheModule->getTargetTriple().empty()) {
     nl(Out) << "mod->setDataLayout(\"" << TheModule->getDataLayoutStr()
             << "\");";

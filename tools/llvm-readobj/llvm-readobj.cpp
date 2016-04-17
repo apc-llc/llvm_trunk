@@ -132,6 +132,10 @@ namespace opts {
   cl::opt<bool> HashTable("hash-table",
     cl::desc("Display ELF hash table"));
 
+  // -gnu-hash-table
+  cl::opt<bool> GnuHashTable("gnu-hash-table",
+    cl::desc("Display ELF .gnu.hash section"));
+
   // -expand-relocs
   cl::opt<bool> ExpandRelocs("expand-relocs",
     cl::desc("Expand each shown relocation to multiple lines"));
@@ -192,6 +196,11 @@ namespace opts {
   MachOIndirectSymbols("macho-indirect-symbols",
                   cl::desc("Display MachO indirect symbols"));
 
+  // -macho-linker-options
+  cl::opt<bool>
+  MachOLinkerOptions("macho-linker-options",
+                  cl::desc("Display MachO linker options"));
+
   // -macho-segment
   cl::opt<bool>
   MachOSegment("macho-segment",
@@ -212,13 +221,35 @@ namespace opts {
   PrintStackMap("stackmap",
                 cl::desc("Display contents of stackmap section"));
 
+  // -version-info
+  cl::opt<bool>
+      VersionInfo("version-info",
+                  cl::desc("Display ELF version sections (if present)"));
+  cl::alias VersionInfoShort("V", cl::desc("Alias for -version-info"),
+                             cl::aliasopt(VersionInfo));
+
+  cl::opt<bool> SectionGroups("elf-section-groups",
+                              cl::desc("Display ELF section group contents"));
+  cl::alias SectionGroupsShort("g", cl::desc("Alias for -elf-sections-groups"),
+                               cl::aliasopt(SectionGroups));
+  cl::opt<bool> HashHistogram(
+      "elf-hash-histogram",
+      cl::desc("Display bucket list histogram for hash sections"));
+  cl::alias HashHistogramShort("I", cl::desc("Alias for -elf-hash-histogram"),
+                               cl::aliasopt(HashHistogram));
+
+  cl::opt<OutputStyleTy>
+      Output("elf-output-style", cl::desc("Specify ELF dump style"),
+             cl::values(clEnumVal(LLVM, "LLVM default style"),
+                        clEnumVal(GNU, "GNU readelf style"), clEnumValEnd),
+             cl::init(LLVM));
 } // namespace opts
 
 namespace llvm {
 
-void reportError(Twine Msg) {
-  outs() << "\nError reading file: " << Msg << ".\n";
-  outs().flush();
+LLVM_ATTRIBUTE_NORETURN void reportError(Twine Msg) {
+  errs() << "\nError reading file: " << Msg << ".\n";
+  errs().flush();
   exit(1);
 }
 
@@ -281,19 +312,18 @@ static std::error_code createDumper(const ObjectFile *Obj, StreamWriter &Writer,
 static void dumpObject(const ObjectFile *Obj) {
   StreamWriter Writer(outs());
   std::unique_ptr<ObjDumper> Dumper;
-  if (std::error_code EC = createDumper(Obj, Writer, Dumper)) {
+  if (std::error_code EC = createDumper(Obj, Writer, Dumper))
     reportError(Obj->getFileName(), EC);
-    return;
-  }
 
-  outs() << '\n';
-  outs() << "File: " << Obj->getFileName() << "\n";
-  outs() << "Format: " << Obj->getFileFormatName() << "\n";
-  outs() << "Arch: "
-         << Triple::getArchTypeName((llvm::Triple::ArchType)Obj->getArch())
-         << "\n";
-  outs() << "AddressSize: " << (8*Obj->getBytesInAddress()) << "bit\n";
-  Dumper->printLoadName();
+  if (opts::Output == opts::LLVM) {
+    outs() << '\n';
+    outs() << "File: " << Obj->getFileName() << "\n";
+    outs() << "Format: " << Obj->getFileFormatName() << "\n";
+    outs() << "Arch: " << Triple::getArchTypeName(
+                              (llvm::Triple::ArchType)Obj->getArch()) << "\n";
+    outs() << "AddressSize: " << (8 * Obj->getBytesInAddress()) << "bit\n";
+    Dumper->printLoadName();
+  }
 
   if (opts::FileHeaders)
     Dumper->printFileHeaders();
@@ -317,16 +347,26 @@ static void dumpObject(const ObjectFile *Obj) {
     Dumper->printProgramHeaders();
   if (opts::HashTable)
     Dumper->printHashTable();
-  if (Obj->getArch() == llvm::Triple::arm && Obj->isELF())
-    if (opts::ARMAttributes)
-      Dumper->printAttributes();
-  if (isMipsArch(Obj->getArch()) && Obj->isELF()) {
-    if (opts::MipsPLTGOT)
-      Dumper->printMipsPLTGOT();
-    if (opts::MipsABIFlags)
-      Dumper->printMipsABIFlags();
-    if (opts::MipsReginfo)
-      Dumper->printMipsReginfo();
+  if (opts::GnuHashTable)
+    Dumper->printGnuHashTable();
+  if (opts::VersionInfo)
+    Dumper->printVersionInfo();
+  if (Obj->isELF()) {
+    if (Obj->getArch() == llvm::Triple::arm)
+      if (opts::ARMAttributes)
+        Dumper->printAttributes();
+    if (isMipsArch(Obj->getArch())) {
+      if (opts::MipsPLTGOT)
+        Dumper->printMipsPLTGOT();
+      if (opts::MipsABIFlags)
+        Dumper->printMipsABIFlags();
+      if (opts::MipsReginfo)
+        Dumper->printMipsReginfo();
+    }
+    if (opts::SectionGroups)
+      Dumper->printGroupSections();
+    if (opts::HashHistogram)
+      Dumper->printHashHistogram();
   }
   if (Obj->isCOFF()) {
     if (opts::COFFImports)
@@ -337,12 +377,16 @@ static void dumpObject(const ObjectFile *Obj) {
       Dumper->printCOFFDirectives();
     if (opts::COFFBaseRelocs)
       Dumper->printCOFFBaseReloc();
+    if (opts::CodeView)
+      Dumper->printCodeViewDebugInfo();
   }
   if (Obj->isMachO()) {
     if (opts::MachODataInCode)
       Dumper->printMachODataInCode();
     if (opts::MachOIndirectSymbols)
       Dumper->printMachOIndirectSymbols();
+    if (opts::MachOLinkerOptions)
+      Dumper->printMachOLinkerOptions();
     if (opts::MachOSegment)
       Dumper->printMachOSegment();
     if (opts::MachOVersionMin)
@@ -356,7 +400,10 @@ static void dumpObject(const ObjectFile *Obj) {
 
 /// @brief Dumps each object file in \a Arc;
 static void dumpArchive(const Archive *Arc) {
-  for (const auto &Child : Arc->children()) {
+  for (auto &ErrorOrChild : Arc->children()) {
+    if (std::error_code EC = ErrorOrChild.getError())
+      reportError(Arc->getFileName(), EC.message());
+    const auto &Child = *ErrorOrChild;
     ErrorOr<std::unique_ptr<Binary>> ChildOrErr = Child.getAsBinary();
     if (std::error_code EC = ChildOrErr.getError()) {
       // Ignore non-object files.
@@ -387,18 +434,11 @@ static void dumpMachOUniversalBinary(const MachOUniversalBinary *UBinary) {
 
 /// @brief Opens \a File and dumps it.
 static void dumpInput(StringRef File) {
-  // If file isn't stdin, check that it exists.
-  if (File != "-" && !sys::fs::exists(File)) {
-    reportError(File, readobj_error::file_not_found);
-    return;
-  }
 
   // Attempt to open the binary.
-  ErrorOr<OwningBinary<Binary>> BinaryOrErr = createBinary(File);
-  if (std::error_code EC = BinaryOrErr.getError()) {
-    reportError(File, EC);
-    return;
-  }
+  Expected<OwningBinary<Binary>> BinaryOrErr = createBinary(File);
+  if (!BinaryOrErr)
+    reportError(File, errorToErrorCode(BinaryOrErr.takeError()));
   Binary &Binary = *BinaryOrErr.get().getBinary();
 
   if (Archive *Arc = dyn_cast<Archive>(&Binary))

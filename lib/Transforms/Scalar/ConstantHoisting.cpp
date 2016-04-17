@@ -320,6 +320,18 @@ void ConstantHoisting::collectConstantCandidates(ConstCandMapType &ConstCandMap,
     if (isa<InlineAsm>(Call->getCalledValue()))
       return;
 
+  // Switch cases must remain constant, and if the value being tested is
+  // constant the entire thing should disappear.
+  if (isa<SwitchInst>(Inst))
+    return;
+
+  // Static allocas (constant size in the entry block) are handled by
+  // prologue/epilogue insertion so they're free anyway. We definitely don't
+  // want to make them non-constant.
+  auto AI = dyn_cast<AllocaInst>(Inst);
+  if (AI && AI->isStaticAlloca())
+    return;
+
   // Scan all operands.
   for (unsigned Idx = 0, E = Inst->getNumOperands(); Idx != E; ++Idx) {
     Value *Opnd = Inst->getOperand(Idx);
@@ -365,9 +377,9 @@ void ConstantHoisting::collectConstantCandidates(ConstCandMapType &ConstCandMap,
 /// into an instruction itself.
 void ConstantHoisting::collectConstantCandidates(Function &Fn) {
   ConstCandMapType ConstCandMap;
-  for (Function::iterator BB : Fn)
-    for (BasicBlock::iterator Inst : *BB)
-      collectConstantCandidates(ConstCandMap, Inst);
+  for (BasicBlock &BB : Fn)
+    for (Instruction &Inst : BB)
+      collectConstantCandidates(ConstCandMap, &Inst);
 }
 
 /// \brief Find the base constant within the given range and rebase all other

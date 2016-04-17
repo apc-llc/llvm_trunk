@@ -244,11 +244,21 @@ def LDARX : XForm_1<31,  84, (outs g8rc:$rD), (ins memrr:$ptr),
 // (EH=1 - see Power ISA 2.07 Book II 4.4.2)
 def LDARXL : XForm_1<31,  84, (outs g8rc:$rD), (ins memrr:$ptr),
                      "ldarx $rD, $ptr, 1", IIC_LdStLDARX, []>, isDOT;
+
+let hasExtraDefRegAllocReq = 1 in
+def LDAT : X_RD5_RS5_IM5<31, 614, (outs g8rc:$rD), (ins g8rc:$rA, u5imm:$FC),
+                         "ldat $rD, $rA, $FC", IIC_LdStLoad>, isPPC64,
+           Requires<[IsISA3_0]>;
 }
 
 let Defs = [CR0], mayStore = 1, hasSideEffects = 0 in
 def STDCX : XForm_1<31, 214, (outs), (ins g8rc:$rS, memrr:$dst),
                     "stdcx. $rS, $dst", IIC_LdStSTDCX, []>, isDOT;
+
+let mayStore = 1, hasSideEffects = 0 in
+def STDAT : X_RD5_RS5_IM5<31, 742, (outs), (ins g8rc:$rS, g8rc:$rA, u5imm:$FC),
+                          "stdat $rS, $rA, $FC", IIC_LdStStore>, isPPC64,
+            Requires<[IsISA3_0]>;
 
 let Interpretation64Bit = 1, isCodeGenOnly = 1 in {
 let isCall = 1, isTerminator = 1, isReturn = 1, isBarrier = 1, Uses = [RM] in
@@ -299,22 +309,35 @@ def : Pat<(PPCtc_return CTRRC8:$dst, imm:$imm),
 // 64-bit CR instructions
 let Interpretation64Bit = 1, isCodeGenOnly = 1 in {
 let hasSideEffects = 0 in {
+// mtocrf's input needs to be prepared by shifting by an amount dependent
+// on the cr register selected. Thus, post-ra anti-dep breaking must not
+// later change that register assignment.
+let hasExtraDefRegAllocReq = 1 in {
 def MTOCRF8: XFXForm_5a<31, 144, (outs crbitm:$FXM), (ins g8rc:$ST),
                         "mtocrf $FXM, $ST", IIC_BrMCRX>,
             PPC970_DGroup_First, PPC970_Unit_CRU;
 
+// Similarly to mtocrf, the mask for mtcrf must be prepared in a way that
+// is dependent on the cr fields being set.
 def MTCRF8 : XFXForm_5<31, 144, (outs), (ins i32imm:$FXM, g8rc:$rS),
                       "mtcrf $FXM, $rS", IIC_BrMCRX>,
             PPC970_MicroCode, PPC970_Unit_CRU;
+} // hasExtraDefRegAllocReq = 1
 
-let hasExtraSrcRegAllocReq = 1 in // to enable post-ra anti-dep breaking.
+// mfocrf's input needs to be prepared by shifting by an amount dependent
+// on the cr register selected. Thus, post-ra anti-dep breaking must not
+// later change that register assignment.
+let hasExtraSrcRegAllocReq = 1 in {
 def MFOCRF8: XFXForm_5a<31, 19, (outs g8rc:$rT), (ins crbitm:$FXM),
                         "mfocrf $rT, $FXM", IIC_SprMFCRF>,
              PPC970_DGroup_First, PPC970_Unit_CRU;
 
+// Similarly to mfocrf, the mask for mfcrf must be prepared in a way that
+// is dependent on the cr fields being copied.
 def MFCR8 : XFXForm_3<31, 19, (outs g8rc:$rT), (ins),
                      "mfcr $rT", IIC_SprMFCR>,
                      PPC970_MicroCode, PPC970_Unit_CRU;
+} // hasExtraSrcRegAllocReq = 1
 } // hasSideEffects = 0
 
 let hasSideEffects = 1, isBarrier = 1, usesCustomInserter = 1 in {
@@ -369,6 +392,8 @@ let Defs = [X1], Uses = [X1] in
 def DYNALLOC8 : Pseudo<(outs g8rc:$result), (ins g8rc:$negsize, memri:$fpsi),"#DYNALLOC8",
                        [(set i64:$result,
                              (PPCdynalloc i64:$negsize, iaddr:$fpsi))]>;
+def DYNAREAOFFSET8 : Pseudo<(outs i64imm:$result), (ins memri:$fpsi), "#DYNAREAOFFSET8",
+                       [(set i64:$result, (PPCdynareaoffset iaddr:$fpsi))]>;
 
 let Defs = [LR8] in {
 def MTLR8  : XFXForm_7_ext<31, 467, 8, (outs), (ins g8rc:$rS),
@@ -549,6 +574,14 @@ let isCompare = 1, hasSideEffects = 0 in {
   def CMPLDI : DForm_6_ext<10, (outs crrc:$dst), (ins g8rc:$src1, u16imm64:$src2),
                            "cmpldi $dst, $src1, $src2",
                            IIC_IntCompare>, isPPC64;
+  let Interpretation64Bit = 1, isCodeGenOnly = 1 in
+  def CMPRB8 : X_BF3_L1_RS5_RS5<31, 192, (outs crbitrc:$BF),
+                                (ins u1imm:$L, g8rc:$rA, g8rc:$rB),
+                                "cmprb $BF, $L, $rA, $rB", IIC_IntCompare, []>,
+               Requires<[IsISA3_0]>;
+  def CMPEQB : X_BF3_RS5_RS5<31, 224, (outs crbitrc:$BF),
+                             (ins g8rc:$rA, g8rc:$rB), "cmpeqb $BF, $rA, $rB",
+                             IIC_IntCompare, []>, Requires<[IsISA3_0]>;
 }
 
 let hasSideEffects = 0 in {
@@ -565,6 +598,9 @@ defm SRAD : XForm_6rc<31, 794, (outs g8rc:$rA), (ins g8rc:$rS, gprc:$rB),
 let Interpretation64Bit = 1, isCodeGenOnly = 1 in {
 defm CNTLZW8 : XForm_11r<31,  26, (outs g8rc:$rA), (ins g8rc:$rS),
                         "cntlzw", "$rA, $rS", IIC_IntGeneral, []>;
+defm CNTTZW8 : XForm_11r<31, 538, (outs g8rc:$rA), (ins g8rc:$rS),
+                        "cnttzw", "$rA, $rS", IIC_IntGeneral, []>,
+               Requires<[IsISA3_0]>;
 
 defm EXTSB8 : XForm_11r<31, 954, (outs g8rc:$rA), (ins g8rc:$rS),
                         "extsb", "$rA, $rS", IIC_IntSimple,
@@ -598,9 +634,12 @@ defm EXTSW_32_64 : XForm_11r<31, 986, (outs g8rc:$rA), (ins gprc:$rS),
 defm SRADI  : XSForm_1rc<31, 413, (outs g8rc:$rA), (ins g8rc:$rS, u6imm:$SH),
                          "sradi", "$rA, $rS, $SH", IIC_IntRotateDI,
                          [(set i64:$rA, (sra i64:$rS, (i32 imm:$SH)))]>, isPPC64;
-defm CNTLZD : XForm_11r<31, 58, (outs g8rc:$rA), (ins g8rc:$rS),
+defm CNTLZD : XForm_11r<31,  58, (outs g8rc:$rA), (ins g8rc:$rS),
                         "cntlzd", "$rA, $rS", IIC_IntGeneral,
                         [(set i64:$rA, (ctlz i64:$rS))]>;
+defm CNTTZD : XForm_11r<31, 570, (outs g8rc:$rA), (ins g8rc:$rS),
+                        "cnttzd", "$rA, $rS", IIC_IntGeneral,
+                        [(set i64:$rA, (cttz i64:$rS))]>, Requires<[IsISA3_0]>;
 def POPCNTD : XForm_11<31, 506, (outs g8rc:$rA), (ins g8rc:$rS),
                        "popcntd $rA, $rS", IIC_IntGeneral,
                        [(set i64:$rA, (ctpop i64:$rS))]>;
@@ -890,6 +929,10 @@ def LDUX : XForm_1<31, 53, (outs g8rc:$rD, ptr_rc_nor0:$ea_result),
                    "ldux $rD, $addr", IIC_LdStLDUX,
                    []>, RegConstraint<"$addr.ptrreg = $ea_result">,
                    NoEncode<"$ea_result">, isPPC64;
+
+def LDMX : XForm_1<31, 309, (outs g8rc:$rD), (ins memrr:$src),
+                   "ldmx $rD, $src", IIC_LdStLD, []>, isPPC64,
+           Requires<[IsISA3_0]>;
 }
 }
 
@@ -1231,3 +1274,81 @@ def : Pat<(atomic_load_64 xaddr:$src),  (LDX memrr:$src)>;
 
 def : Pat<(atomic_store_64 ixaddr:$ptr, i64:$val), (STD  g8rc:$val, memrix:$ptr)>;
 def : Pat<(atomic_store_64 xaddr:$ptr,  i64:$val), (STDX g8rc:$val, memrr:$ptr)>;
+
+let Predicates = [IsISA3_0] in {
+
+// [PO RT RA RB RC XO]
+class VA_RT5_RA5_RB5_RC5<bits<6> xo, string opc, InstrItinClass itin,
+                         list<dag> pattern>
+  : VAForm_1a<xo, (outs g8rc:$rD), (ins g8rc:$rA, g8rc:$rB, g8rc:$rC),
+              !strconcat(opc, " $rD, $rA, $rB, $rC"), itin, pattern>;
+
+// 64-bit Fixed-Point Multiply-Add High-DWord/High-DWord-Unsigned/Low-DWord
+def MADDHD  : VA_RT5_RA5_RB5_RC5<48, "maddhd" , IIC_IntGeneral, []>;
+def MADDHDU : VA_RT5_RA5_RB5_RC5<49, "maddhdu", IIC_IntGeneral, []>;
+def MADDLD  : VA_RT5_RA5_RB5_RC5<51, "maddld ", IIC_IntGeneral, []>;
+
+let Interpretation64Bit = 1, isCodeGenOnly = 1 in {
+// Add PC Immediate Shifted
+def ADDPCIS8 : DX_RD5_IM16<19, 2, (outs g8rc:$rD), (ins s16imm:$IMM),
+                           "addpcis $rD, $IMM", IIC_IntSimple, []>;
+
+// Modulo {Signed/Unsigned}-Word
+def MODSW8 : X_RT5_RA5_RB5<779, "modsw", g8rc, IIC_IntDivW, []>;
+def MODUW8 : X_RT5_RA5_RB5<267, "moduw", g8rc, IIC_IntDivW, []>;
+}
+
+// Modulo {Signed/Unsigned}-DWord
+def MODSD  : X_RT5_RA5_RB5<777, "modsd", g8rc, IIC_IntDivW, []>;
+def MODUD  : X_RT5_RA5_RB5<265, "modud", g8rc, IIC_IntDivW, []>;
+
+// [PO RS RA sh XO sh Rc]
+multiclass XS_RS5_RA5_SH5r<bits<6> opcode, bits<9> xo, string opc,
+                           InstrItinClass itin, list<dag> pattern> {
+  let BaseName = opc in {
+    def NAME : XSForm_1<opcode, xo, (outs g8rc:$rA), (ins g8rc:$rS, u6imm:$SH),
+                        !strconcat(opc, " $rA, $rS, $SH"), itin, pattern>;
+    let Defs = [CR0] in
+    def o    : XSForm_1<opcode, xo, (outs g8rc:$rA), (ins g8rc:$rS, u6imm:$SH),
+                        !strconcat(opc, ". $rA, $rS, $SH"), itin, pattern>,
+               isDOT;
+  }
+}
+
+// Deliver A Random Number
+def DARN : X_RD5_L2<31, 755, (outs g8rc:$rD), (ins u2imm:$L), "darn $rD, $L",
+                    IIC_IntGeneral, []>;
+
+// Extend-Sign Word and Shift Left Immediate
+defm EXTSWSLI  : XS_RS5_RA5_SH5r<31, 445, "extswsli" , IIC_IntShift, []>;
+
+// Set Boolean
+def SETB : X_RD5_BFA3<31, 128, (outs g8rc:$rD), (ins u3imm:$BFA),
+                      "setb $rD, $BFA", IIC_IntGeneral, []>;
+
+// DFP Test Significance Immediate [Quad]
+def DTSTSFI  : X_BF3_IM6_RS5<59, 675,
+                             (outs crbitrc:$BF), (ins u6imm:$UIM, f8rc:$FRB),
+                             "dtstsfi $BF, $UIM, $FRB", IIC_FPGeneral, []>;
+def DTSTSFIQ : X_BF3_IM6_RS5<63,  675,
+                             (outs crbitrc:$BF), (ins u6imm:$UIM, d8rc:$FRBp),
+                             "dtstsfiq $BF, $UIM, $FRBp", IIC_FPGeneral, []>;
+
+class X_L1_RA5_RB5<bits<6> opcode, bits<10> xo, string opc, RegisterOperand ty,
+                   InstrItinClass itin, list<dag> pattern>
+  : X_L1_RS5_RS5<opcode, xo, (outs), (ins ty:$rA, ty:$rB, u1imm:$L),
+                 !strconcat(opc, " $rA, $rB, $L"), itin, pattern>;
+
+let Interpretation64Bit = 1, isCodeGenOnly = 1 in {
+def CP_COPY8   : X_L1_RA5_RB5<31, 774, "copy"  , g8rc, IIC_LdStCOPY, []>;
+def CP_PASTE8  : X_L1_RA5_RB5<31, 902, "paste" , g8rc, IIC_LdStPASTE, []>;
+def CP_PASTE8o : X_L1_RA5_RB5<31, 902, "paste.", g8rc, IIC_LdStPASTE, []>,isDOT;
+}
+
+// SLB Invalidate Entry Global
+def SLBIEG : XForm_26<31, 466, (outs), (ins gprc:$RS, gprc:$RB),
+                      "slbieg $RS, $RB", IIC_SprSLBIEG, []>;
+// SLB Synchronize
+def SLBSYNC : XForm_0<31, 338, (outs), (ins), "slbsync", IIC_SprSLBSYNC, []>;
+
+} // IsISA3_0

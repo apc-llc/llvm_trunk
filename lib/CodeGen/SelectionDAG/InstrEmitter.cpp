@@ -22,6 +22,7 @@
 #include "llvm/CodeGen/MachineRegisterInfo.h"
 #include "llvm/CodeGen/StackMaps.h"
 #include "llvm/IR/DataLayout.h"
+#include "llvm/IR/DebugInfo.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/MathExtras.h"
@@ -139,7 +140,7 @@ EmitCopyFromReg(SDNode *Node, unsigned ResNo, bool IsClone, bool IsCloned,
               UseRC = RC;
             else if (RC) {
               const TargetRegisterClass *ComRC =
-                TRI->getCommonSubClass(UseRC, RC);
+                TRI->getCommonSubClass(UseRC, RC, VT.SimpleTy);
               // If multiple uses expect disjoint register classes, we emit
               // copies in AddRegisterOperand.
               if (ComRC)

@@ -17,6 +17,7 @@
 #include "llvm/CodeGen/MachineFunction.h"
 #include "llvm/CodeGen/MachineModuleInfo.h"
 #include "llvm/CodeGen/MachineRegisterInfo.h"
+#include "llvm/IR/CallingConv.h"
 #include "llvm/IR/Function.h"
 #include "llvm/Target/TargetRegisterInfo.h"
 #include "llvm/Target/TargetSubtargetInfo.h"
@@ -62,11 +63,14 @@ void TargetFrameLowering::determineCalleeSaves(MachineFunction &MF,
   const TargetRegisterInfo &TRI = *MF.getSubtarget().getRegisterInfo();
   const MCPhysReg *CSRegs = TRI.getCalleeSavedRegs(&MF);
 
+  // Resize before the early returns. Some backends expect that
+  // SavedRegs.size() == TRI.getNumRegs() after this call even if there are no
+  // saved registers.
+  SavedRegs.resize(TRI.getNumRegs());
+
   // Early exit if there are no callee saved registers.
   if (!CSRegs || CSRegs[0] == 0)
     return;
-
-  SavedRegs.resize(TRI.getNumRegs());
 
   // In Naked functions we aren't going to save any registers.
   if (MF.getFunction()->hasFnAttribute(Attribute::Naked))
@@ -80,4 +84,14 @@ void TargetFrameLowering::determineCalleeSaves(MachineFunction &MF,
     if (CallsUnwindInit || MRI.isPhysRegModified(Reg))
       SavedRegs.set(Reg);
   }
+}
+
+unsigned TargetFrameLowering::getStackAlignmentSkew(
+    const MachineFunction &MF) const {
+  // When HHVM function is called, the stack is skewed as the return address
+  // is removed from the stack before we enter the function.
+  if (LLVM_UNLIKELY(MF.getFunction()->getCallingConv() == CallingConv::HHVM))
+    return MF.getTarget().getPointerSize();
+
+  return 0;
 }

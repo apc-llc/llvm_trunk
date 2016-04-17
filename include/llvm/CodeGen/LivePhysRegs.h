@@ -84,12 +84,8 @@ public:
   void removeReg(unsigned Reg) {
     assert(TRI && "LivePhysRegs is not initialized.");
     assert(Reg <= TRI->getNumRegs() && "Expected a physical register.");
-    for (MCSubRegIterator SubRegs(Reg, TRI, /*IncludeSelf=*/true);
-         SubRegs.isValid(); ++SubRegs)
-      LiveRegs.erase(*SubRegs);
-    for (MCSuperRegIterator SuperRegs(Reg, TRI, /*IncludeSelf=*/false);
-         SuperRegs.isValid(); ++SuperRegs)
-      LiveRegs.erase(*SuperRegs);
+    for (MCRegAliasIterator R(Reg, TRI, true); R.isValid(); ++R)
+      LiveRegs.erase(*R);
   }
 
   /// \brief Removes physical registers clobbered by the regmask operand @p MO.
@@ -122,9 +118,9 @@ public:
   void addLiveIns(const MachineBasicBlock *MBB, bool AddPristines = false);
 
   /// \brief Adds all live-out registers of basic block @p MBB; After prologue/
-  /// epilogue insertion \p AddPristines should be set to true to insert the
-  /// pristine registers.
-  void addLiveOuts(const MachineBasicBlock *MBB, bool AddPristines = false);
+  /// epilogue insertion \p AddPristinesAndCSRs should be set to true.
+  void addLiveOuts(const MachineBasicBlock *MBB,
+                   bool AddPristinesAndCSRs = false);
 
   typedef SparseSet<unsigned>::const_iterator const_iterator;
   const_iterator begin() const { return LiveRegs.begin(); }

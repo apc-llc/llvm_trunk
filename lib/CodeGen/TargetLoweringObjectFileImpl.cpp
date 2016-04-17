@@ -24,6 +24,7 @@
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/Mangler.h"
 #include "llvm/IR/Module.h"
+#include "llvm/MC/MCAsmInfo.h"
 #include "llvm/MC/MCContext.h"
 #include "llvm/MC/MCExpr.h"
 #include "llvm/MC/MCSectionCOFF.h"
@@ -32,6 +33,8 @@
 #include "llvm/MC/MCStreamer.h"
 #include "llvm/MC/MCSymbolELF.h"
 #include "llvm/MC/MCValue.h"
+#include "llvm/ProfileData/InstrProf.h"
+#include "llvm/ProfileData/ProfileCommon.h"
 #include "llvm/Support/COFF.h"
 #include "llvm/Support/Dwarf.h"
 #include "llvm/Support/ELF.h"
@@ -118,6 +121,10 @@ getELFKindForNamedSection(StringRef Name, SectionKind K) {
   // section(".eh_frame") gcc will produce:
   //
   //   .section   .eh_frame,"a",@progbits
+  
+  if (Name == getInstrProfCoverageSectionName(false))
+    return SectionKind::getMetadata();
+
   if (Name.empty() || Name[0] != '.') return K;
 
   // Some lame default implementation based on some magic section names.
@@ -232,17 +239,16 @@ static StringRef getSectionPrefixForGlobal(SectionKind Kind) {
     return ".tdata";
   if (Kind.isThreadBSS())
     return ".tbss";
-  if (Kind.isDataNoRel())
+  if (Kind.isData())
     return ".data";
-  if (Kind.isDataRelLocal())
-    return ".data.rel.local";
-  if (Kind.isDataRel())
-    return ".data.rel";
-  if (Kind.isReadOnlyWithRelLocal())
-    return ".data.rel.ro.local";
   assert(Kind.isReadOnlyWithRel() && "Unknown section kind");
   return ".data.rel.ro";
 }
+
+static cl::opt<bool> GroupFunctionsByHotness(
+    "group-functions-by-hotness",
+    llvm::cl::desc("Partition hot/cold functions by sections prefix"),
+    cl::init(false));
 
 static MCSectionELF *
 selectELFSectionForGlobal(MCContext &Ctx, const GlobalValue *GV,
@@ -264,9 +270,11 @@ selectELFSectionForGlobal(MCContext &Ctx, const GlobalValue *GV,
       EntrySize = 4;
     } else if (Kind.isMergeableConst8()) {
       EntrySize = 8;
-    } else {
-      assert(Kind.isMergeableConst16() && "unknown data width");
+    } else if (Kind.isMergeableConst16()) {
       EntrySize = 16;
+    } else {
+      assert(Kind.isMergeableConst32() && "unknown data width");
+      EntrySize = 32;
     }
   }
 
@@ -292,6 +300,16 @@ selectELFSectionForGlobal(MCContext &Ctx, const GlobalValue *GV,
     Name += utostr(EntrySize);
   } else {
     Name = getSectionPrefixForGlobal(Kind);
+  }
+
+  if (GroupFunctionsByHotness) {
+    if (const Function *F = dyn_cast<Function>(GV)) {
+      if (ProfileSummary::isFunctionHot(F)) {
+        Name += getHotSectionPrefix();
+      } else if (ProfileSummary::isFunctionUnlikely(F)) {
+        Name += getUnlikelySectionPrefix();
+      }
+    }
   }
 
   if (EmitUniqueSection && UniqueSectionNames) {
@@ -351,17 +369,19 @@ bool TargetLoweringObjectFileELF::shouldPutJumpTableInFunctionSection(
 /// Given a mergeable constant with the specified size and relocation
 /// information, return a section that it should be placed in.
 MCSection *TargetLoweringObjectFileELF::getSectionForConstant(
-    const DataLayout &DL, SectionKind Kind, const Constant *C) const {
+    const DataLayout &DL, SectionKind Kind, const Constant *C,
+    unsigned &Align) const {
   if (Kind.isMergeableConst4() && MergeableConst4Section)
     return MergeableConst4Section;
   if (Kind.isMergeableConst8() && MergeableConst8Section)
     return MergeableConst8Section;
   if (Kind.isMergeableConst16() && MergeableConst16Section)
     return MergeableConst16Section;
+  if (Kind.isMergeableConst32() && MergeableConst32Section)
+    return MergeableConst32Section;
   if (Kind.isReadOnly())
     return ReadOnlySection;
 
-  if (Kind.isReadOnlyWithRelLocal()) return DataRelROLocalSection;
   assert(Kind.isReadOnlyWithRel() && "Unknown section kind");
   return DataRelROSection;
 }
@@ -465,6 +485,7 @@ emitModuleFlags(MCStreamer &Streamer,
     } else if (Key == "Objective-C Garbage Collection" ||
                Key == "Objective-C GC Only" ||
                Key == "Objective-C Is Simulated" ||
+               Key == "Objective-C Class Properties" ||
                Key == "Objective-C Image Swift Version") {
       ImageInfoFlags |= mdconst::extract<ConstantInt>(Val)->getZExtValue();
     } else if (Key == "Objective-C Image Info Section") {
@@ -506,7 +527,7 @@ emitModuleFlags(MCStreamer &Streamer,
 
   // Get the section.
   MCSectionMachO *S = getContext().getMachOSection(
-      Segment, Section, TAA, StubSize, SectionKind::getDataNoRel());
+      Segment, Section, TAA, StubSize, SectionKind::getData());
   Streamer.SwitchSection(S);
   Streamer.EmitLabel(getContext().
                      getOrCreateSymbol(StringRef("L_OBJC_IMAGE_INFO")));
@@ -636,10 +657,11 @@ MCSection *TargetLoweringObjectFileMachO::SelectSectionForGlobal(
 }
 
 MCSection *TargetLoweringObjectFileMachO::getSectionForConstant(
-    const DataLayout &DL, SectionKind Kind, const Constant *C) const {
+    const DataLayout &DL, SectionKind Kind, const Constant *C,
+    unsigned &Align) const {
   // If this constant requires a relocation, we have to put it in the data
   // segment, not in the text segment.
-  if (Kind.isDataRel() || Kind.isReadOnlyWithRel())
+  if (Kind.isData() || Kind.isReadOnlyWithRel())
     return ConstDataSection;
 
   if (Kind.isMergeableConst4())
@@ -761,6 +783,29 @@ const MCExpr *TargetLoweringObjectFileMachO::getIndirectSymViaGOTPCRel(
   const MCExpr *RHS =
     MCBinaryExpr::createAdd(BSymExpr, MCConstantExpr::create(Offset, Ctx), Ctx);
   return MCBinaryExpr::createSub(LHS, RHS, Ctx);
+}
+
+static bool canUsePrivateLabel(const MCAsmInfo &AsmInfo,
+                               const MCSection &Section) {
+  if (!AsmInfo.isSectionAtomizableBySymbols(Section))
+    return true;
+
+  // If it is not dead stripped, it is safe to use private labels.
+  const MCSectionMachO &SMO = cast<MCSectionMachO>(Section);
+  if (SMO.hasAttribute(MachO::S_ATTR_NO_DEAD_STRIP))
+    return true;
+
+  return false;
+}
+
+void TargetLoweringObjectFileMachO::getNameWithPrefix(
+    SmallVectorImpl<char> &OutName, const GlobalValue *GV, Mangler &Mang,
+    const TargetMachine &TM) const {
+  SectionKind GVKind = TargetLoweringObjectFile::getKindForGlobal(GV, TM);
+  const MCSection *TheSection = SectionForGlobal(GV, GVKind, Mang, TM);
+  bool CannotUsePrivateLabel =
+      !canUsePrivateLabel(*TM.getMCAsmInfo(), *TheSection);
+  Mang.getNameWithPrefix(OutName, GV, CannotUsePrivateLabel);
 }
 
 //===----------------------------------------------------------------------===//
@@ -918,7 +963,7 @@ MCSection *TargetLoweringObjectFileCOFF::SelectSectionForGlobal(
                                          COMDATSymName, Selection);
     } else {
       SmallString<256> TmpData;
-      getNameWithPrefix(TmpData, GV, /*CannotUsePrivateLabel=*/true, Mang, TM);
+      Mang.getNameWithPrefix(TmpData, GV, /*CannotUsePrivateLabel=*/true);
       return getContext().getCOFFSection(Name, Characteristics, Kind, TmpData,
                                          Selection);
     }
@@ -943,8 +988,9 @@ MCSection *TargetLoweringObjectFileCOFF::SelectSectionForGlobal(
 }
 
 void TargetLoweringObjectFileCOFF::getNameWithPrefix(
-    SmallVectorImpl<char> &OutName, const GlobalValue *GV,
-    bool CannotUsePrivateLabel, Mangler &Mang, const TargetMachine &TM) const {
+    SmallVectorImpl<char> &OutName, const GlobalValue *GV, Mangler &Mang,
+    const TargetMachine &TM) const {
+  bool CannotUsePrivateLabel = false;
   if (GV->hasPrivateLinkage() &&
       ((isa<Function>(GV) && TM.getFunctionSections()) ||
        (isa<GlobalVariable>(GV) && TM.getDataSections())))

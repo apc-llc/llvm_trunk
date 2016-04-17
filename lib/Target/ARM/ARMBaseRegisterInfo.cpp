@@ -49,12 +49,9 @@ ARMBaseRegisterInfo::ARMBaseRegisterInfo()
     : ARMGenRegisterInfo(ARM::LR, 0, 0, ARM::PC), BasePtr(ARM::R6) {}
 
 static unsigned getFramePointerReg(const ARMSubtarget &STI) {
-  if (STI.isTargetMachO()) {
-    if (STI.isTargetDarwin() || STI.isThumb1Only())
-      return ARM::R7;
-    else
-      return ARM::R11;
-  } else if (STI.isTargetWindows())
+  if (STI.isTargetMachO())
+    return ARM::R7;
+  else if (STI.isTargetWindows())
     return ARM::R11;
   else // ARM EABI
     return STI.isThumb() ? ARM::R7 : ARM::R11;
@@ -87,7 +84,24 @@ ARMBaseRegisterInfo::getCalleeSavedRegs(const MachineFunction *MF) const {
     }
   }
 
+  if (STI.isTargetDarwin() && STI.getTargetLowering()->supportSwiftError() &&
+      F->getAttributes().hasAttrSomewhere(Attribute::SwiftError))
+    return CSR_iOS_SwiftError_SaveList;
+
+  if (STI.isTargetDarwin() && F->getCallingConv() == CallingConv::CXX_FAST_TLS)
+    return MF->getInfo<ARMFunctionInfo>()->isSplitCSR()
+               ? CSR_iOS_CXX_TLS_PE_SaveList
+               : CSR_iOS_CXX_TLS_SaveList;
   return RegList;
+}
+
+const MCPhysReg *ARMBaseRegisterInfo::getCalleeSavedRegsViaCopy(
+    const MachineFunction *MF) const {
+  assert(MF && "Invalid MachineFunction pointer.");
+  if (MF->getFunction()->getCallingConv() == CallingConv::CXX_FAST_TLS &&
+      MF->getInfo<ARMFunctionInfo>()->isSplitCSR())
+    return CSR_iOS_CXX_TLS_ViaCopy_SaveList;
+  return nullptr;
 }
 
 const uint32_t *
@@ -97,6 +111,13 @@ ARMBaseRegisterInfo::getCallPreservedMask(const MachineFunction &MF,
   if (CC == CallingConv::GHC)
     // This is academic becase all GHC calls are (supposed to be) tail calls
     return CSR_NoRegs_RegMask;
+
+  if (STI.isTargetDarwin() && STI.getTargetLowering()->supportSwiftError() &&
+      MF.getFunction()->getAttributes().hasAttrSomewhere(Attribute::SwiftError))
+    return CSR_iOS_SwiftError_RegMask;
+
+  if (STI.isTargetDarwin() && CC == CallingConv::CXX_FAST_TLS)
+    return CSR_iOS_CXX_TLS_RegMask;
   return STI.isTargetDarwin() ? CSR_iOS_RegMask : CSR_AAPCS_RegMask;
 }
 
@@ -104,6 +125,14 @@ const uint32_t*
 ARMBaseRegisterInfo::getNoPreservedMask() const {
   return CSR_NoRegs_RegMask;
 }
+
+const uint32_t *
+ARMBaseRegisterInfo::getTLSCallPreservedMask(const MachineFunction &MF) const {
+  assert(MF.getSubtarget<ARMSubtarget>().isTargetDarwin() &&
+         "only know about special TLS call on Darwin");
+  return CSR_iOS_TLSCall_RegMask;
+}
+
 
 const uint32_t *
 ARMBaseRegisterInfo::getThisReturnPreservedMask(const MachineFunction &MF,
@@ -144,9 +173,8 @@ getReservedRegs(const MachineFunction &MF) const {
     Reserved.set(ARM::R9);
   // Reserve D16-D31 if the subtarget doesn't support them.
   if (!STI.hasVFP3() || STI.hasD16()) {
-    assert(ARM::D31 == ARM::D16 + 15);
-    for (unsigned i = 0; i != 16; ++i)
-      Reserved.set(ARM::D16 + i);
+    static_assert(ARM::D31 == ARM::D16 + 15, "Register list not consecutive!");
+    Reserved.set(ARM::D16, ARM::D31 + 1);
   }
   const TargetRegisterClass *RC  = &ARM::GPRPairRegClass;
   for(TargetRegisterClass::iterator I = RC->begin(), E = RC->end(); I!=E; ++I)

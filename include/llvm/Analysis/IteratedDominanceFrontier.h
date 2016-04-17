@@ -28,13 +28,10 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/IR/BasicBlock.h"
+#include "llvm/IR/Dominators.h"
 
 namespace llvm {
-
-class BasicBlock;
-template <class T> class DomTreeNodeBase;
-typedef DomTreeNodeBase<BasicBlock> DomTreeNode;
-class DominatorTree;
 
 /// \brief Determine the iterated dominance frontier, given a set of defining
 /// blocks, and optionally, a set of live-in blocks.
@@ -47,7 +44,7 @@ class DominatorTree;
 class IDFCalculator {
 
 public:
-  IDFCalculator(DominatorTree &DT) : DT(DT), useLiveIn(false) {}
+  IDFCalculator(DominatorTreeBase<BasicBlock> &DT) : DT(DT), useLiveIn(false) {}
 
   /// \brief Give the IDF calculator the set of blocks in which the value is
   /// defined.  This is equivalent to the set of starting blocks it should be
@@ -85,7 +82,7 @@ public:
   void calculate(SmallVectorImpl<BasicBlock *> &IDFBlocks);
 
 private:
-  DominatorTree &DT;
+  DominatorTreeBase<BasicBlock> &DT;
   bool useLiveIn;
   DenseMap<DomTreeNode *, unsigned> DomLevels;
   const SmallPtrSetImpl<BasicBlock *> *LiveInBlocks;

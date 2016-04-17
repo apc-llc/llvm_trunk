@@ -87,27 +87,6 @@ bool NVPTXInstrInfo::isMoveInstr(const MachineInstr &MI, unsigned &SrcReg,
   return false;
 }
 
-bool NVPTXInstrInfo::isReadSpecialReg(MachineInstr &MI) const {
-  switch (MI.getOpcode()) {
-  default:
-    return false;
-  case NVPTX::INT_PTX_SREG_NTID_X:
-  case NVPTX::INT_PTX_SREG_NTID_Y:
-  case NVPTX::INT_PTX_SREG_NTID_Z:
-  case NVPTX::INT_PTX_SREG_TID_X:
-  case NVPTX::INT_PTX_SREG_TID_Y:
-  case NVPTX::INT_PTX_SREG_TID_Z:
-  case NVPTX::INT_PTX_SREG_CTAID_X:
-  case NVPTX::INT_PTX_SREG_CTAID_Y:
-  case NVPTX::INT_PTX_SREG_CTAID_Z:
-  case NVPTX::INT_PTX_SREG_NCTAID_X:
-  case NVPTX::INT_PTX_SREG_NCTAID_Y:
-  case NVPTX::INT_PTX_SREG_NCTAID_Z:
-  case NVPTX::INT_PTX_SREG_WARPSIZE:
-    return true;
-  }
-}
-
 bool NVPTXInstrInfo::isLoadInstr(const MachineInstr &MI,
                                  unsigned &AddrSpace) const {
   bool isLoad = false;
@@ -171,14 +150,14 @@ bool NVPTXInstrInfo::AnalyzeBranch(
     SmallVectorImpl<MachineOperand> &Cond, bool AllowModify) const {
   // If the block has no terminators, it just falls into the block after it.
   MachineBasicBlock::iterator I = MBB.end();
-  if (I == MBB.begin() || !isUnpredicatedTerminator(--I))
+  if (I == MBB.begin() || !isUnpredicatedTerminator(*--I))
     return false;
 
   // Get the last instruction in the block.
   MachineInstr *LastInst = I;
 
   // If there is only one terminator instruction, process it.
-  if (I == MBB.begin() || !isUnpredicatedTerminator(--I)) {
+  if (I == MBB.begin() || !isUnpredicatedTerminator(*--I)) {
     if (LastInst->getOpcode() == NVPTX::GOTO) {
       TBB = LastInst->getOperand(0).getMBB();
       return false;
@@ -196,7 +175,7 @@ bool NVPTXInstrInfo::AnalyzeBranch(
   MachineInstr *SecondLastInst = I;
 
   // If there are three terminators, we don't know what sort of block this is.
-  if (SecondLastInst && I != MBB.begin() && isUnpredicatedTerminator(--I))
+  if (SecondLastInst && I != MBB.begin() && isUnpredicatedTerminator(*--I))
     return true;
 
   // If the block ends with NVPTX::GOTO and NVPTX:CBranch, handle it.

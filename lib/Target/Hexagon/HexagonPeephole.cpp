@@ -124,7 +124,7 @@ bool HexagonPeephole::runOnMachineFunction(MachineFunction &MF) {
   // Loop over all of the basic blocks.
   for (MachineFunction::iterator MBBb = MF.begin(), MBBe = MF.end();
        MBBb != MBBe; ++MBBb) {
-    MachineBasicBlock* MBB = MBBb;
+    MachineBasicBlock *MBB = &*MBBb;
     PeepholeMap.clear();
     PeepholeDoubleRegsMap.clear();
 
@@ -180,7 +180,7 @@ bool HexagonPeephole::runOnMachineFunction(MachineFunction &MF) {
         unsigned DstReg = Dst.getReg();
         unsigned SrcReg = Src1.getReg();
         PeepholeDoubleRegsMap[DstReg] =
-          std::make_pair(*&SrcReg, 1/*Hexagon::subreg_hireg*/);
+          std::make_pair(*&SrcReg, Hexagon::subreg_hireg);
       }
 
       // Look for P=NOT(P).
@@ -243,7 +243,7 @@ bool HexagonPeephole::runOnMachineFunction(MachineFunction &MF) {
       // Look for Predicated instructions.
       if (!DisablePNotP) {
         bool Done = false;
-        if (QII->isPredicated(MI)) {
+        if (QII->isPredicated(*MI)) {
           MachineOperand &Op0 = MI->getOperand(0);
           unsigned Reg0 = Op0.getReg();
           const TargetRegisterClass *RC0 = MRI->getRegClass(Reg0);

@@ -11,9 +11,12 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "llvm/ADT/EquivalenceClasses.h"
+#include "llvm/Analysis/DemandedBits.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/ScalarEvolutionExpressions.h"
 #include "llvm/Analysis/ScalarEvolution.h"
+#include "llvm/Analysis/TargetTransformInfo.h"
 #include "llvm/Analysis/VectorUtils.h"
 #include "llvm/IR/GetElementPtrTypeIterator.h"
 #include "llvm/IR/PatternMatch.h"
@@ -118,10 +121,10 @@ llvm::checkBinaryFloatSignature(const CallInst &I,
 /// \brief Returns intrinsic ID for call.
 /// For the input call instruction it finds mapping intrinsic and returns
 /// its ID, in case it does not found it return not_intrinsic.
-Intrinsic::ID llvm::getIntrinsicIDForCall(CallInst *CI,
+Intrinsic::ID llvm::getIntrinsicIDForCall(const CallInst *CI,
                                           const TargetLibraryInfo *TLI) {
   // If we have an intrinsic call, check if it is trivially vectorizable.
-  if (IntrinsicInst *II = dyn_cast<IntrinsicInst>(CI)) {
+  if (const auto *II = dyn_cast<IntrinsicInst>(CI)) {
     Intrinsic::ID ID = II->getIntrinsicID();
     if (isTriviallyVectorizable(ID) || ID == Intrinsic::lifetime_start ||
         ID == Intrinsic::lifetime_end || ID == Intrinsic::assume)
@@ -217,6 +220,12 @@ Intrinsic::ID llvm::getIntrinsicIDForCall(CallInst *CI,
   case LibFunc::powf:
   case LibFunc::powl:
     return checkBinaryFloatSignature(*CI, Intrinsic::pow);
+  case LibFunc::sqrt:
+  case LibFunc::sqrtf:
+  case LibFunc::sqrtl:
+    if (CI->hasNoNaNs())
+      return checkUnaryFloatSignature(*CI, Intrinsic::sqrt);
+    return Intrinsic::not_intrinsic;
   }
 
   return Intrinsic::not_intrinsic;
@@ -228,8 +237,7 @@ Intrinsic::ID llvm::getIntrinsicIDForCall(CallInst *CI,
 unsigned llvm::getGEPInductionOperand(const GetElementPtrInst *Gep) {
   const DataLayout &DL = Gep->getModule()->getDataLayout();
   unsigned LastOperand = Gep->getNumOperands() - 1;
-  unsigned GEPAllocSize = DL.getTypeAllocSize(
-      cast<PointerType>(Gep->getType()->getScalarType())->getElementType());
+  unsigned GEPAllocSize = DL.getTypeAllocSize(Gep->getResultElementType());
 
   // Walk backwards and try to peel off zeros.
   while (LastOperand > 1 && match(Gep->getOperand(LastOperand), m_Zero())) {
@@ -315,14 +323,11 @@ Value *llvm::getStrideFromPointer(Value *Ptr, ScalarEvolution *SE, Loop *Lp) {
   // Strip off the size of access multiplication if we are still analyzing the
   // pointer.
   if (OrigPtr == Ptr) {
-    const DataLayout &DL = Lp->getHeader()->getModule()->getDataLayout();
-    DL.getTypeAllocSize(PtrTy->getElementType());
     if (const SCEVMulExpr *M = dyn_cast<SCEVMulExpr>(V)) {
       if (M->getOperand(0)->getSCEVType() != scConstant)
         return nullptr;
 
-      const APInt &APStepVal =
-          cast<SCEVConstant>(M->getOperand(0))->getValue()->getValue();
+      const APInt &APStepVal = cast<SCEVConstant>(M->getOperand(0))->getAPInt();
 
       // Huge step value - give up.
       if (APStepVal.getBitWidth() > 64)
@@ -414,9 +419,11 @@ Value *llvm::findScalarElement(Value *V, unsigned EltNo) {
 /// the input value is (1) a splat constants vector or (2) a sequence
 /// of instructions that broadcast a single value into a vector.
 ///
-llvm::Value *llvm::getSplatValue(Value *V) {
-  if (auto *CV = dyn_cast<ConstantDataVector>(V))
-    return CV->getSplatValue();
+const llvm::Value *llvm::getSplatValue(const Value *V) {
+
+  if (auto *C = dyn_cast<Constant>(V))
+    if (isa<VectorType>(V->getType()))
+      return C->getSplatValue();
 
   auto *ShuffleInst = dyn_cast<ShuffleVectorInst>(V);
   if (!ShuffleInst)
@@ -433,4 +440,146 @@ llvm::Value *llvm::getSplatValue(Value *V) {
     return nullptr;
 
   return InsertEltInst->getOperand(1);
+}
+
+MapVector<Instruction *, uint64_t>
+llvm::computeMinimumValueSizes(ArrayRef<BasicBlock *> Blocks, DemandedBits &DB,
+                               const TargetTransformInfo *TTI) {
+
+  // DemandedBits will give us every value's live-out bits. But we want
+  // to ensure no extra casts would need to be inserted, so every DAG
+  // of connected values must have the same minimum bitwidth.
+  EquivalenceClasses<Value *> ECs;
+  SmallVector<Value *, 16> Worklist;
+  SmallPtrSet<Value *, 4> Roots;
+  SmallPtrSet<Value *, 16> Visited;
+  DenseMap<Value *, uint64_t> DBits;
+  SmallPtrSet<Instruction *, 4> InstructionSet;
+  MapVector<Instruction *, uint64_t> MinBWs;
+
+  // Determine the roots. We work bottom-up, from truncs or icmps.
+  bool SeenExtFromIllegalType = false;
+  for (auto *BB : Blocks)
+    for (auto &I : *BB) {
+      InstructionSet.insert(&I);
+
+      if (TTI && (isa<ZExtInst>(&I) || isa<SExtInst>(&I)) &&
+          !TTI->isTypeLegal(I.getOperand(0)->getType()))
+        SeenExtFromIllegalType = true;
+
+      // Only deal with non-vector integers up to 64-bits wide.
+      if ((isa<TruncInst>(&I) || isa<ICmpInst>(&I)) &&
+          !I.getType()->isVectorTy() &&
+          I.getOperand(0)->getType()->getScalarSizeInBits() <= 64) {
+        // Don't make work for ourselves. If we know the loaded type is legal,
+        // don't add it to the worklist.
+        if (TTI && isa<TruncInst>(&I) && TTI->isTypeLegal(I.getType()))
+          continue;
+
+        Worklist.push_back(&I);
+        Roots.insert(&I);
+      }
+    }
+  // Early exit.
+  if (Worklist.empty() || (TTI && !SeenExtFromIllegalType))
+    return MinBWs;
+
+  // Now proceed breadth-first, unioning values together.
+  while (!Worklist.empty()) {
+    Value *Val = Worklist.pop_back_val();
+    Value *Leader = ECs.getOrInsertLeaderValue(Val);
+
+    if (Visited.count(Val))
+      continue;
+    Visited.insert(Val);
+
+    // Non-instructions terminate a chain successfully.
+    if (!isa<Instruction>(Val))
+      continue;
+    Instruction *I = cast<Instruction>(Val);
+
+    // If we encounter a type that is larger than 64 bits, we can't represent
+    // it so bail out.
+    if (DB.getDemandedBits(I).getBitWidth() > 64)
+      return MapVector<Instruction *, uint64_t>();
+
+    uint64_t V = DB.getDemandedBits(I).getZExtValue();
+    DBits[Leader] |= V;
+    DBits[I] = V;
+
+    // Casts, loads and instructions outside of our range terminate a chain
+    // successfully.
+    if (isa<SExtInst>(I) || isa<ZExtInst>(I) || isa<LoadInst>(I) ||
+        !InstructionSet.count(I))
+      continue;
+
+    // Unsafe casts terminate a chain unsuccessfully. We can't do anything
+    // useful with bitcasts, ptrtoints or inttoptrs and it'd be unsafe to
+    // transform anything that relies on them.
+    if (isa<BitCastInst>(I) || isa<PtrToIntInst>(I) || isa<IntToPtrInst>(I) ||
+        !I->getType()->isIntegerTy()) {
+      DBits[Leader] |= ~0ULL;
+      continue;
+    }
+
+    // We don't modify the types of PHIs. Reductions will already have been
+    // truncated if possible, and inductions' sizes will have been chosen by
+    // indvars.
+    if (isa<PHINode>(I))
+      continue;
+
+    if (DBits[Leader] == ~0ULL)
+      // All bits demanded, no point continuing.
+      continue;
+
+    for (Value *O : cast<User>(I)->operands()) {
+      ECs.unionSets(Leader, O);
+      Worklist.push_back(O);
+    }
+  }
+
+  // Now we've discovered all values, walk them to see if there are
+  // any users we didn't see. If there are, we can't optimize that
+  // chain.
+  for (auto &I : DBits)
+    for (auto *U : I.first->users())
+      if (U->getType()->isIntegerTy() && DBits.count(U) == 0)
+        DBits[ECs.getOrInsertLeaderValue(I.first)] |= ~0ULL;
+
+  for (auto I = ECs.begin(), E = ECs.end(); I != E; ++I) {
+    uint64_t LeaderDemandedBits = 0;
+    for (auto MI = ECs.member_begin(I), ME = ECs.member_end(); MI != ME; ++MI)
+      LeaderDemandedBits |= DBits[*MI];
+
+    uint64_t MinBW = (sizeof(LeaderDemandedBits) * 8) -
+                     llvm::countLeadingZeros(LeaderDemandedBits);
+    // Round up to a power of 2
+    if (!isPowerOf2_64((uint64_t)MinBW))
+      MinBW = NextPowerOf2(MinBW);
+
+    // We don't modify the types of PHIs. Reductions will already have been
+    // truncated if possible, and inductions' sizes will have been chosen by
+    // indvars.
+    // If we are required to shrink a PHI, abandon this entire equivalence class.
+    bool Abort = false;
+    for (auto MI = ECs.member_begin(I), ME = ECs.member_end(); MI != ME; ++MI)
+      if (isa<PHINode>(*MI) && MinBW < (*MI)->getType()->getScalarSizeInBits()) {
+        Abort = true;
+        break;
+      }
+    if (Abort)
+      continue;
+
+    for (auto MI = ECs.member_begin(I), ME = ECs.member_end(); MI != ME; ++MI) {
+      if (!isa<Instruction>(*MI))
+        continue;
+      Type *Ty = (*MI)->getType();
+      if (Roots.count(*MI))
+        Ty = cast<Instruction>(*MI)->getOperand(0)->getType();
+      if (MinBW < Ty->getScalarSizeInBits())
+        MinBWs[cast<Instruction>(*MI)] = MinBW;
+    }
+  }
+
+  return MinBWs;
 }

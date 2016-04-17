@@ -100,7 +100,7 @@ private:
 };
 typedef content_iterator<ExportEntry> export_iterator;
 
-/// MachORebaseEntry encapsulates the current state in the decompression of   
+/// MachORebaseEntry encapsulates the current state in the decompression of
 /// rebasing opcodes. This allows you to iterate through the compressed table of
 /// rebasing using:
 ///    for (const llvm::object::MachORebaseEntry &Entry : Obj->rebaseTable()) {
@@ -116,7 +116,7 @@ public:
   bool operator==(const MachORebaseEntry &) const;
 
   void moveNext();
-  
+
 private:
   friend class MachOObjectFile;
   void moveToFirst();
@@ -193,8 +193,8 @@ public:
   typedef SmallVector<LoadCommandInfo, 4> LoadCommandList;
   typedef LoadCommandList::const_iterator load_command_iterator;
 
-  MachOObjectFile(MemoryBufferRef Object, bool IsLittleEndian, bool Is64Bits,
-                  std::error_code &EC);
+  static Expected<std::unique_ptr<MachOObjectFile>>
+  create(MemoryBufferRef Object, bool IsLittleEndian, bool Is64Bits);
 
   void moveSymbolNext(DataRefImpl &Symb) const override;
 
@@ -208,7 +208,7 @@ public:
   ErrorOr<uint64_t> getSymbolAddress(DataRefImpl Symb) const override;
   uint32_t getSymbolAlignment(DataRefImpl Symb) const override;
   uint64_t getCommonSymbolSizeImpl(DataRefImpl Symb) const override;
-  SymbolRef::Type getSymbolType(DataRefImpl Symb) const override;
+  ErrorOr<SymbolRef::Type> getSymbolType(DataRefImpl Symb) const override;
   uint32_t getSymbolFlags(DataRefImpl Symb) const override;
   ErrorOr<section_iterator> getSymbolSection(DataRefImpl Symb) const override;
   unsigned getSymbolSectionID(SymbolRef Symb) const;
@@ -226,6 +226,7 @@ public:
   bool isSectionData(DataRefImpl Sec) const override;
   bool isSectionBSS(DataRefImpl Sec) const override;
   bool isSectionVirtual(DataRefImpl Sec) const override;
+  bool isSectionBitcode(DataRefImpl Sec) const override;
   relocation_iterator section_rel_begin(DataRefImpl Sec) const override;
   relocation_iterator section_rel_end(DataRefImpl Sec) const override;
 
@@ -441,6 +442,10 @@ public:
   }
 
 private:
+
+  MachOObjectFile(MemoryBufferRef Object, bool IsLittleEndian, bool Is64Bits,
+                  Error &Err);
+
   uint64_t getSymbolValueImpl(DataRefImpl Symb) const override;
 
   union {
@@ -521,4 +526,3 @@ inline const ObjectFile *DiceRef::getObjectFile() const {
 }
 
 #endif
-

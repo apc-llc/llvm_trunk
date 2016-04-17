@@ -174,7 +174,7 @@ void MipsAsmPrinter::EmitInstruction(const MachineInstr *MI) {
   }
 
 
-  MachineBasicBlock::const_instr_iterator I = MI;
+  MachineBasicBlock::const_instr_iterator I = MI->getIterator();
   MachineBasicBlock::const_instr_iterator E = MI->getParent()->instr_end();
 
   do {
@@ -202,7 +202,7 @@ void MipsAsmPrinter::EmitInstruction(const MachineInstr *MI) {
       llvm_unreachable("Pseudo opcode found in EmitInstruction()");
 
     MCInst TmpInst0;
-    MCInstLowering.Lower(I, TmpInst0);
+    MCInstLowering.Lower(&*I, TmpInst0);
     EmitToStreamer(*OutStreamer, TmpInst0);
   } while ((++I != E) && I->isInsideBundle()); // Delay slot check
 }
@@ -618,24 +618,6 @@ void MipsAsmPrinter::printOperand(const MachineInstr *MI, int opNum,
   }
 
   if (closeP) O << ")";
-}
-
-void MipsAsmPrinter::printUnsignedImm(const MachineInstr *MI, int opNum,
-                                      raw_ostream &O) {
-  const MachineOperand &MO = MI->getOperand(opNum);
-  if (MO.isImm())
-    O << (unsigned short int)MO.getImm();
-  else
-    printOperand(MI, opNum, O);
-}
-
-void MipsAsmPrinter::printUnsignedImm8(const MachineInstr *MI, int opNum,
-                                       raw_ostream &O) {
-  const MachineOperand &MO = MI->getOperand(opNum);
-  if (MO.isImm())
-    O << (unsigned short int)(unsigned char)MO.getImm();
-  else
-    printOperand(MI, opNum, O);
 }
 
 void MipsAsmPrinter::
@@ -1071,10 +1053,9 @@ void MipsAsmPrinter::NaClAlignIndirectJumpTargets(MachineFunction &MF) {
   }
 
   // If basic block address is taken, block can be target of indirect branch.
-  for (MachineFunction::iterator MBB = MF.begin(), E = MF.end();
-                                 MBB != E; ++MBB) {
-    if (MBB->hasAddressTaken())
-      MBB->setAlignment(MIPS_NACL_BUNDLE_ALIGN);
+  for (auto &MBB : MF) {
+    if (MBB.hasAddressTaken())
+      MBB.setAlignment(MIPS_NACL_BUNDLE_ALIGN);
   }
 }
 

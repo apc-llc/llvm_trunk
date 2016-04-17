@@ -50,6 +50,8 @@ def DirectivePwr8: SubtargetFeature<"", "DarwinDirective", "PPC::DIR_PWR8", "">;
 
 def Feature64Bit     : SubtargetFeature<"64bit","Has64BitSupport", "true",
                                         "Enable 64-bit instructions">;
+def FeatureSoftFloat : SubtargetFeature<"soft-float", "UseSoftFloat", "true",
+                              "Use software emulation for floating point">;                                        
 def Feature64BitRegs : SubtargetFeature<"64bitregs","Use64BitRegs", "true",
                               "Enable 64-bit registers usage for ppc32 [beta]">;
 def FeatureCRBits    : SubtargetFeature<"crbits", "UseCRBits", "true",
@@ -84,8 +86,6 @@ def FeatureFPCVT     : SubtargetFeature<"fpcvt", "HasFPCVT", "true",
   "Enable fc[ft]* (unsigned and single-precision) and lfiwzx instructions">;
 def FeatureISEL      : SubtargetFeature<"isel","HasISEL", "true",
                                         "Enable the isel instruction">;
-def FeaturePOPCNTD   : SubtargetFeature<"popcntd","HasPOPCNTD", "true",
-                                        "Enable the popcnt[dw] instructions">;
 def FeatureBPERMD    : SubtargetFeature<"bpermd", "HasBPERMD", "true",
                                         "Enable the bpermd instruction">;
 def FeatureExtDiv    : SubtargetFeature<"extdiv", "HasExtDiv", "true",
@@ -137,9 +137,35 @@ def FeatureHTM : SubtargetFeature<"htm", "HasHTM", "true",
                                   "Enable Hardware Transactional Memory instructions">;
 def FeatureMFTB   : SubtargetFeature<"", "FeatureMFTB", "true",
                                         "Implement mftb using the mfspr instruction">;
+def FeatureFusion : SubtargetFeature<"fusion", "HasFusion", "true",
+                                     "Target supports add/load integer fusion.">;
+def FeatureFloat128 :
+  SubtargetFeature<"float128", "HasFloat128", "true",
+                   "Enable the __float128 data type for IEEE-754R Binary128.",
+                   [FeatureVSX]>;
+def FeaturePOPCNTD   : SubtargetFeature<"popcntd","HasPOPCNTD",
+                                        "POPCNTD_Fast",
+                                        "Enable the popcnt[dw] instructions">;
+// Note that for the a2/a2q processor models we should not use popcnt[dw] by
+// default. These processors do support the instructions, but they're
+// microcoded, and the software emulation is about twice as fast.
+def FeatureSlowPOPCNTD : SubtargetFeature<"slow-popcntd","HasPOPCNTD",
+                                          "POPCNTD_Slow",
+                                          "Has slow popcnt[dw] instructions">;
 
 def DeprecatedDST    : SubtargetFeature<"", "DeprecatedDST", "true",
   "Treat vector data stream cache control instructions as deprecated">;
+
+def FeatureISA3_0 : SubtargetFeature<"isa-v30-instructions", "IsISA3_0",
+                                     "true",
+                                     "Enable instructions added in ISA 3.0.">;
+def FeatureP9Altivec : SubtargetFeature<"power9-altivec", "HasP9Altivec", "true",
+                                        "Enable POWER9 Altivec instructions",
+                                        [FeatureISA3_0, FeatureP8Altivec]>;
+def FeatureP9Vector  : SubtargetFeature<"power9-vector", "HasP9Vector", "true",
+                                        "Enable POWER9 vector instructions",
+                                        [FeatureISA3_0, FeatureP8Vector,
+                                         FeatureP9Altivec]>;
 
 /*  Since new processors generally contain a superset of features of those that
     came before them, the idea is to make implementations of new processors
@@ -168,9 +194,12 @@ def ProcessorFeatures {
        FeatureMFTB, DeprecatedDST];
   list<SubtargetFeature> Power8SpecificFeatures =
       [DirectivePwr8, FeatureP8Altivec, FeatureP8Vector, FeatureP8Crypto,
-       FeatureHTM, FeatureDirectMove, FeatureICBT, FeaturePartwordAtomic];
+       FeatureHTM, FeatureDirectMove, FeatureICBT, FeaturePartwordAtomic,
+       FeatureFusion];
   list<SubtargetFeature> Power8FeatureList =
       !listconcat(Power7FeatureList, Power8SpecificFeatures);
+  list<SubtargetFeature> Power9SpecificFeatures =
+      [FeatureP9Altivec, FeatureP9Vector, FeatureISA3_0];
 }
 
 // Note: Future features to add when support is extended to more
@@ -309,7 +338,7 @@ def : ProcessorModel<"g5", G5Model,
                    Feature64Bit /*, Feature64BitRegs */,
                    FeatureMFTB, DeprecatedDST]>;
 def : ProcessorModel<"e500mc", PPCE500mcModel,
-                  [DirectiveE500mc, FeatureMFOCRF,
+                  [DirectiveE500mc,
                    FeatureSTFIWX, FeatureICBT, FeatureBookE, 
                    FeatureISEL, FeatureMFTB]>;
 def : ProcessorModel<"e5500", PPCE5500Model,
@@ -322,16 +351,17 @@ def : ProcessorModel<"a2", PPCA2Model,
                    FeatureFRSQRTE, FeatureFRSQRTES, FeatureRecipPrec,
                    FeatureSTFIWX, FeatureLFIWAX,
                    FeatureFPRND, FeatureFPCVT, FeatureISEL,
-                   FeaturePOPCNTD, FeatureCMPB, FeatureLDBRX, Feature64Bit
-               /*, Feature64BitRegs */, FeatureMFTB]>;
+                   FeatureSlowPOPCNTD, FeatureCMPB, FeatureLDBRX,
+                   Feature64Bit /*, Feature64BitRegs */, FeatureMFTB]>;
 def : ProcessorModel<"a2q", PPCA2Model,
                   [DirectiveA2, FeatureICBT, FeatureBookE, FeatureMFOCRF,
                    FeatureFCPSGN, FeatureFSqrt, FeatureFRE, FeatureFRES,
                    FeatureFRSQRTE, FeatureFRSQRTES, FeatureRecipPrec,
                    FeatureSTFIWX, FeatureLFIWAX,
                    FeatureFPRND, FeatureFPCVT, FeatureISEL,
-                   FeaturePOPCNTD, FeatureCMPB, FeatureLDBRX, Feature64Bit
-               /*, Feature64BitRegs */, FeatureQPX, FeatureMFTB]>;
+                   FeatureSlowPOPCNTD, FeatureCMPB, FeatureLDBRX,
+                   Feature64Bit /*, Feature64BitRegs */, FeatureQPX,
+                   FeatureMFTB]>;
 def : ProcessorModel<"pwr3", G5Model,
                   [DirectivePwr3, FeatureAltivec,
                    FeatureFRES, FeatureFRSQRTE, FeatureMFOCRF,
@@ -403,6 +433,7 @@ def PPCAsmParserVariant : AsmParserVariant {
   // InstAlias definitions use immediate literals.  Set RegisterPrefix
   // so that those are not misinterpreted as registers.
   string RegisterPrefix = "%";
+  string BreakCharacters = ".";
 }
 
 def PPC : Target {

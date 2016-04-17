@@ -14,8 +14,8 @@
 #ifndef LLVM_IR_LEGACYPASSMANAGERS_H
 #define LLVM_IR_LEGACYPASSMANAGERS_H
 
-#include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/FoldingSet.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Pass.h"
@@ -92,12 +92,13 @@
 #include "llvm/Support/PrettyStackTrace.h"
 
 namespace llvm {
-  class Module;
-  class Pass;
-  class StringRef;
-  class Value;
-  class Timer;
-  class PMDataManager;
+template <typename T> class ArrayRef;
+class Module;
+class Pass;
+class StringRef;
+class Value;
+class Timer;
+class PMDataManager;
 
 // enums for debugging strings
 enum PassDebuggingString {
@@ -118,6 +119,7 @@ class PassManagerPrettyStackEntry : public PrettyStackTraceEntry {
   Pass *P;
   Value *V;
   Module *M;
+
 public:
   explicit PassManagerPrettyStackEntry(Pass *p)
     : P(p), V(nullptr), M(nullptr) {}  // When P is releaseMemory'd.
@@ -129,7 +131,6 @@ public:
   /// print - Emit information about this stack frame to OS.
   void print(raw_ostream &OS) const override;
 };
-
 
 //===----------------------------------------------------------------------===//
 // PMStack
@@ -157,7 +158,6 @@ public:
 private:
   std::vector<PMDataManager *> S;
 };
-
 
 //===----------------------------------------------------------------------===//
 // PMTopLevelManager
@@ -204,10 +204,7 @@ public:
   virtual ~PMTopLevelManager();
 
   /// Add immutable pass and initialize it.
-  inline void addImmutablePass(ImmutablePass *P) {
-    P->initializePass();
-    ImmutablePasses.push_back(P);
-  }
+  void addImmutablePass(ImmutablePass *P);
 
   inline SmallVectorImpl<ImmutablePass *>& getImmutablePasses() {
     return ImmutablePasses;
@@ -231,12 +228,10 @@ public:
   PMStack activeStack;
 
 protected:
-
   /// Collection of pass managers
   SmallVector<PMDataManager *, 8> PassManagers;
 
 private:
-
   /// Collection of pass managers that are not directly maintained
   /// by this pass manager
   SmallVector<PMDataManager *, 8> IndirectPassManagers;
@@ -253,7 +248,46 @@ private:
   /// Immutable passes are managed by top level manager.
   SmallVector<ImmutablePass *, 16> ImmutablePasses;
 
-  DenseMap<Pass *, AnalysisUsage *> AnUsageMap;
+  /// Map from ID to immutable passes.
+  SmallDenseMap<AnalysisID, ImmutablePass *, 8> ImmutablePassMap;
+
+
+  /// A wrapper around AnalysisUsage for the purpose of uniqueing.  The wrapper
+  /// is used to avoid needing to make AnalysisUsage itself a folding set node.
+  struct AUFoldingSetNode : public FoldingSetNode {
+    AnalysisUsage AU;
+    AUFoldingSetNode(const AnalysisUsage &AU) : AU(AU) {}
+    void Profile(FoldingSetNodeID &ID) const {
+      Profile(ID, AU);
+    }
+    static void Profile(FoldingSetNodeID &ID, const AnalysisUsage &AU) {
+      // TODO: We could consider sorting the dependency arrays within the
+      // AnalysisUsage (since they are conceptually unordered).
+      ID.AddBoolean(AU.getPreservesAll());
+      auto ProfileVec = [&](const SmallVectorImpl<AnalysisID>& Vec) {
+        ID.AddInteger(Vec.size());
+        for(AnalysisID AID : Vec)
+          ID.AddPointer(AID);
+      };
+      ProfileVec(AU.getRequiredSet());
+      ProfileVec(AU.getRequiredTransitiveSet());
+      ProfileVec(AU.getPreservedSet());
+      ProfileVec(AU.getUsedSet());
+    }
+  };
+
+  // Contains all of the unique combinations of AnalysisUsage.  This is helpful
+  // when we have multiple instances of the same pass since they'll usually
+  // have the same analysis usage and can share storage.
+  FoldingSet<AUFoldingSetNode> UniqueAnalysisUsages;
+  
+  // Allocator used for allocating UAFoldingSetNodes.  This handles deletion of
+  // all allocated nodes in one fell swoop.
+  SpecificBumpPtrAllocator<AUFoldingSetNode> AUFoldingSetNodeAllocator;
+  
+  // Maps from a pass to it's associated entry in UniqueAnalysisUsages.  Does
+  // not own the storage associated with either key or value.. 
+  DenseMap<Pass *, AnalysisUsage*> AnUsageMap;
 
   /// Collection of PassInfo objects found via analysis IDs and in this top
   /// level manager. This is used to memoize queries to the pass registry.
@@ -262,8 +296,6 @@ private:
   mutable DenseMap<AnalysisID, const PassInfo *> AnalysisPassInfos;
 };
 
-
-
 //===----------------------------------------------------------------------===//
 // PMDataManager
 
@@ -271,7 +303,6 @@ private:
 /// used by pass managers.
 class PMDataManager {
 public:
-
   explicit PMDataManager() : TPM(nullptr), Depth(0) {
     initializeAnalysisInfo();
   }
@@ -318,7 +349,6 @@ public:
   // Return true if P preserves high level analysis used by other
   // passes that are managed by this manager.
   bool preserveHigherLevelAnalysis(Pass *P);
-
 
   /// Populate UsedPasses with analysis pass that are used or required by pass
   /// P and are available. Populate ReqPassNotAvailable with analysis pass that
@@ -375,7 +405,6 @@ public:
   }
 
 protected:
-
   // Top level manager.
   PMTopLevelManager *TPM;
 
@@ -440,9 +469,9 @@ public:
 
   /// doFinalization - Overrides ModulePass doFinalization for global
   /// finalization tasks
-  /// 
+  ///
   using ModulePass::doFinalization;
-  
+
   /// doFinalization - Run all of the finalizers for the function passes.
   ///
   bool doFinalization(Module &M) override;
@@ -474,7 +503,6 @@ public:
 };
 
 Timer *getPassTimer(Pass *);
-
 }
 
 #endif

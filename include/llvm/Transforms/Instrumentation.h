@@ -34,6 +34,8 @@ inline void *getDFSanRetValTLSPtrForJIT() {
 
 namespace llvm {
 
+class TargetMachine;
+
 /// Instrumentation passes often insert conditional checks into entry blocks.
 /// Call this function before splitting the entry block to move instructions
 /// that must remain in the entry block up before the split point. Static
@@ -77,6 +79,11 @@ struct GCOVOptions {
 ModulePass *createGCOVProfilerPass(const GCOVOptions &Options =
                                    GCOVOptions::getDefault());
 
+// PGO Instrumention
+ModulePass *createPGOInstrumentationGenPass();
+ModulePass *
+createPGOInstrumentationUsePass(StringRef Filename = StringRef(""));
+
 /// Options for the frontend instrumentation based profiling pass.
 struct InstrProfOptions {
   InstrProfOptions() : NoRedZone(false) {}
@@ -93,8 +100,10 @@ ModulePass *createInstrProfilingPass(
     const InstrProfOptions &Options = InstrProfOptions());
 
 // Insert AddressSanitizer (address sanity checking) instrumentation
-FunctionPass *createAddressSanitizerFunctionPass(bool CompileKernel = false);
-ModulePass *createAddressSanitizerModulePass(bool CompileKernel = false);
+FunctionPass *createAddressSanitizerFunctionPass(bool CompileKernel = false,
+                                                 bool Recover = false);
+ModulePass *createAddressSanitizerModulePass(bool CompileKernel = false,
+                                             bool Recover = false);
 
 // Insert MemorySanitizer instrumentation (detection of uninitialized reads)
 FunctionPass *createMemorySanitizerPass(int TrackOrigins = 0);
@@ -111,7 +120,7 @@ ModulePass *createDataFlowSanitizerPass(
 struct SanitizerCoverageOptions {
   SanitizerCoverageOptions()
       : CoverageType(SCK_None), IndirectCalls(false), TraceBB(false),
-        TraceCmp(false), Use8bitCounters(false) {}
+        TraceCmp(false), Use8bitCounters(false), TracePC(false) {}
 
   enum Type {
     SCK_None = 0,
@@ -123,6 +132,7 @@ struct SanitizerCoverageOptions {
   bool TraceBB;
   bool TraceCmp;
   bool Use8bitCounters;
+  bool TracePC;
 };
 
 // Insert SanitizerCoverage instrumentation.
@@ -141,9 +151,23 @@ inline ModulePass *createDataFlowSanitizerPassForJIT(
 // checking on loads, stores, and other memory intrinsics.
 FunctionPass *createBoundsCheckingPass();
 
-/// \brief This pass splits the stack into a safe stack and an unsafe stack to
-/// protect against stack-based overflow vulnerabilities.
-FunctionPass *createSafeStackPass();
+/// \brief Calculate what to divide by to scale counts.
+///
+/// Given the maximum count, calculate a divisor that will scale all the
+/// weights to strictly less than UINT32_MAX.
+static inline uint64_t calculateCountScale(uint64_t MaxCount) {
+  return MaxCount < UINT32_MAX ? 1 : MaxCount / UINT32_MAX + 1;
+}
+
+/// \brief Scale an individual branch count.
+///
+/// Scale a 64-bit weight down to 32-bits using \c Scale.
+///
+static inline uint32_t scaleBranchCount(uint64_t Count, uint64_t Scale) {
+  uint64_t Scaled = Count / Scale;
+  assert(Scaled <= UINT32_MAX && "overflow 32-bits");
+  return Scaled;
+}
 
 } // End llvm namespace
 

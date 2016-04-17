@@ -22,7 +22,7 @@ using namespace llvm;
 #define DEBUG_TYPE "loweratomic"
 
 static bool LowerAtomicCmpXchgInst(AtomicCmpXchgInst *CXI) {
-  IRBuilder<> Builder(CXI->getParent(), CXI);
+  IRBuilder<> Builder(CXI);
   Value *Ptr = CXI->getPointerOperand();
   Value *Cmp = CXI->getCompareOperand();
   Value *Val = CXI->getNewValOperand();
@@ -41,7 +41,7 @@ static bool LowerAtomicCmpXchgInst(AtomicCmpXchgInst *CXI) {
 }
 
 static bool LowerAtomicRMWInst(AtomicRMWInst *RMWI) {
-  IRBuilder<> Builder(RMWI->getParent(), RMWI);
+  IRBuilder<> Builder(RMWI);
   Value *Ptr = RMWI->getPointerOperand();
   Value *Val = RMWI->getValOperand();
 
@@ -100,12 +100,12 @@ static bool LowerFenceInst(FenceInst *FI) {
 }
 
 static bool LowerLoadInst(LoadInst *LI) {
-  LI->setAtomic(NotAtomic);
+  LI->setAtomic(AtomicOrdering::NotAtomic);
   return true;
 }
 
 static bool LowerStoreInst(StoreInst *SI) {
-  SI->setAtomic(NotAtomic);
+  SI->setAtomic(AtomicOrdering::NotAtomic);
   return true;
 }
 
@@ -120,7 +120,7 @@ namespace {
         return false;
       bool Changed = false;
       for (BasicBlock::iterator DI = BB.begin(), DE = BB.end(); DI != DE; ) {
-        Instruction *Inst = DI++;
+        Instruction *Inst = &*DI++;
         if (FenceInst *FI = dyn_cast<FenceInst>(Inst))
           Changed |= LowerFenceInst(FI);
         else if (AtomicCmpXchgInst *CXI = dyn_cast<AtomicCmpXchgInst>(Inst))

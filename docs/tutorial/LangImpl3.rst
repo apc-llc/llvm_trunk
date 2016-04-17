@@ -67,18 +67,18 @@ way to model this. Again, this tutorial won't dwell on good software
 engineering practices: for our purposes, adding a virtual method is
 simplest.
 
-The second thing we want is an "Error" method like we used for the
+The second thing we want is an "LogError" method like we used for the
 parser, which will be used to report errors found during code generation
 (for example, use of an undeclared parameter):
 
 .. code-block:: c++
 
     static std::unique_ptr<Module> *TheModule;
-    static IRBuilder<> Builder(getGlobalContext());
+    static IRBuilder<> Builder(LLVMContext);
     static std::map<std::string, Value*> NamedValues;
 
-    Value *ErrorV(const char *Str) {
-      Error(Str);
+    Value *LogErrorV(const char *Str) {
+      LogError(Str);
       return nullptr;
     }
 
@@ -116,7 +116,7 @@ First we'll do numeric literals:
 .. code-block:: c++
 
     Value *NumberExprAST::codegen() {
-      return ConstantFP::get(getGlobalContext(), APFloat(Val));
+      return ConstantFP::get(LLVMContext, APFloat(Val));
     }
 
 In the LLVM IR, numeric constants are represented with the
@@ -133,7 +133,7 @@ are all uniqued together and shared. For this reason, the API uses the
       // Look this variable up in the function.
       Value *V = NamedValues[Name];
       if (!V)
-        ErrorV("Unknown variable name");
+        LogErrorV("Unknown variable name");
       return V;
     }
 
@@ -144,8 +144,8 @@ values that can be in the ``NamedValues`` map are function arguments.
 This code simply checks to see that the specified name is in the map (if
 not, an unknown variable is being referenced) and returns the value for
 it. In future chapters, we'll add support for `loop induction
-variables <LangImpl5.html#for>`_ in the symbol table, and for `local
-variables <LangImpl7.html#localvars>`_.
+variables <LangImpl5.html#for-loop-expression>`_ in the symbol table, and for `local
+variables <LangImpl7.html#user-defined-local-variables>`_.
 
 .. code-block:: c++
 
@@ -165,10 +165,10 @@ variables <LangImpl7.html#localvars>`_.
       case '<':
         L = Builder.CreateFCmpULT(L, R, "cmptmp");
         // Convert bool 0/1 to double 0.0 or 1.0
-        return Builder.CreateUIToFP(L, Type::getDoubleTy(getGlobalContext()),
+        return Builder.CreateUIToFP(L, Type::getDoubleTy(LLVMContext),
                                     "booltmp");
       default:
-        return ErrorV("invalid binary operator");
+        return LogErrorV("invalid binary operator");
       }
     }
 
@@ -190,22 +190,22 @@ automatically provide each one with an increasing, unique numeric
 suffix. Local value names for instructions are purely optional, but it
 makes it much easier to read the IR dumps.
 
-`LLVM instructions <../LangRef.html#instref>`_ are constrained by strict
+`LLVM instructions <../LangRef.html#instruction-reference>`_ are constrained by strict
 rules: for example, the Left and Right operators of an `add
-instruction <../LangRef.html#i_add>`_ must have the same type, and the
+instruction <../LangRef.html#add-instruction>`_ must have the same type, and the
 result type of the add must match the operand types. Because all values
 in Kaleidoscope are doubles, this makes for very simple code for add,
 sub and mul.
 
 On the other hand, LLVM specifies that the `fcmp
-instruction <../LangRef.html#i_fcmp>`_ always returns an 'i1' value (a
+instruction <../LangRef.html#fcmp-instruction>`_ always returns an 'i1' value (a
 one bit integer). The problem with this is that Kaleidoscope wants the
 value to be a 0.0 or 1.0 value. In order to get these semantics, we
 combine the fcmp instruction with a `uitofp
-instruction <../LangRef.html#i_uitofp>`_. This instruction converts its
+instruction <../LangRef.html#uitofp-to-instruction>`_. This instruction converts its
 input integer into a floating point value by treating the input as an
 unsigned value. In contrast, if we used the `sitofp
-instruction <../LangRef.html#i_sitofp>`_, the Kaleidoscope '<' operator
+instruction <../LangRef.html#sitofp-to-instruction>`_, the Kaleidoscope '<' operator
 would return 0.0 and -1.0, depending on the input value.
 
 .. code-block:: c++
@@ -214,11 +214,11 @@ would return 0.0 and -1.0, depending on the input value.
       // Look up the name in the global module table.
       Function *CalleeF = TheModule->getFunction(Callee);
       if (!CalleeF)
-        return ErrorV("Unknown function referenced");
+        return LogErrorV("Unknown function referenced");
 
       // If argument mismatch error.
       if (CalleeF->arg_size() != Args.size())
-        return ErrorV("Incorrect # arguments passed");
+        return LogErrorV("Incorrect # arguments passed");
 
       std::vector<Value *> ArgsV;
       for (unsigned i = 0, e = Args.size(); i != e; ++i) {
@@ -238,7 +238,7 @@ can use the LLVM symbol table to resolve function names for us.
 
 Once we have the function to call, we recursively codegen each argument
 that is to be passed in, and create an LLVM `call
-instruction <../LangRef.html#i_call>`_. Note that LLVM uses the native C
+instruction <../LangRef.html#call-instruction>`_. Note that LLVM uses the native C
 calling conventions by default, allowing these calls to also call into
 standard library functions like "sin" and "cos", with no additional
 effort.
@@ -264,9 +264,9 @@ with:
     Function *PrototypeAST::codegen() {
       // Make the function type:  double(double,double) etc.
       std::vector<Type*> Doubles(Args.size(),
-                                 Type::getDoubleTy(getGlobalContext()));
+                                 Type::getDoubleTy(LLVMContext));
       FunctionType *FT =
-        FunctionType::get(Type::getDoubleTy(getGlobalContext()), Doubles, false);
+        FunctionType::get(Type::getDoubleTy(LLVMContext), Doubles, false);
 
       Function *F =
         Function::Create(FT, Function::ExternalLinkage, Name, TheModule);
@@ -328,7 +328,7 @@ codegen and attach a function body.
       return nullptr;
 
     if (!TheFunction->empty())
-      return (Function*)ErrorV("Function cannot be redefined.");
+      return (Function*)LogErrorV("Function cannot be redefined.");
 
 
 For function definitions, we start by searching TheModule's symbol table for an
@@ -340,7 +340,7 @@ assert that the function is empty (i.e. has no body yet) before we start.
 .. code-block:: c++
 
   // Create a new basic block to start insertion into.
-  BasicBlock *BB = BasicBlock::Create(getGlobalContext(), "entry", TheFunction);
+  BasicBlock *BB = BasicBlock::Create(LLVMContext, "entry", TheFunction);
   Builder.SetInsertPoint(BB);
 
   // Record the function arguments in the NamedValues map.
@@ -377,7 +377,7 @@ Once the insertion point has been set up and the NamedValues map populated,
 we call the ``codegen()`` method for the root expression of the function. If no
 error happens, this emits code to compute the expression into the entry block
 and returns the value that was computed. Assuming no error, we then create an
-LLVM `ret instruction <../LangRef.html#i_ret>`_, which completes the function.
+LLVM `ret instruction <../LangRef.html#ret-instruction>`_, which completes the function.
 Once the function is built, we call ``verifyFunction``, which is
 provided by LLVM. This function does a variety of consistency checks on
 the generated code, to determine if our compiler is doing everything
@@ -430,10 +430,10 @@ at the LLVM IR for simple functions. For example:
 
 Note how the parser turns the top-level expression into anonymous
 functions for us. This will be handy when we add `JIT
-support <LangImpl4.html#jit>`_ in the next chapter. Also note that the
+support <LangImpl4.html#adding-a-jit-compiler>`_ in the next chapter. Also note that the
 code is very literally transcribed, no optimizations are being performed
 except simple constant folding done by IRBuilder. We will `add
-optimizations <LangImpl4.html#trivialconstfold>`_ explicitly in the next
+optimizations <LangImpl4.html#trivial-constant-folding>`_ explicitly in the next
 chapter.
 
 ::

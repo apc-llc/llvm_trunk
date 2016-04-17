@@ -15,26 +15,18 @@
 #ifndef LLVM_IR_DOMINATORS_H
 #define LLVM_IR_DOMINATORS_H
 
-#include "llvm/ADT/DenseMap.h"
-#include "llvm/ADT/DepthFirstIterator.h"
 #include "llvm/ADT/GraphTraits.h"
 #include "llvm/ADT/SmallPtrSet.h"
-#include "llvm/ADT/SmallVector.h"
-#include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/CFG.h"
-#include "llvm/IR/Function.h"
+#include "llvm/IR/PassManager.h"
 #include "llvm/Pass.h"
-#include "llvm/Support/Compiler.h"
 #include "llvm/Support/GenericDomTree.h"
-#include "llvm/Support/raw_ostream.h"
-#include <algorithm>
 
 namespace llvm {
 
-// FIXME: Replace this brittle forward declaration with the include of the new
-// PassManager.h when doing so doesn't break the PassManagerBuilder.
-template <typename IRUnitT> class AnalysisManager;
-class PreservedAnalyses;
+class Function;
+class BasicBlock;
+class raw_ostream;
 
 extern template class DomTreeNodeBase<BasicBlock>;
 extern template class DominatorTreeBase<BasicBlock>;
@@ -64,6 +56,22 @@ public:
 
 /// \brief Concrete subclass of DominatorTreeBase that is used to compute a
 /// normal dominator tree.
+///
+/// Definition: A block is said to be forward statically reachable if there is
+/// a path from the entry of the function to the block.  A statically reachable
+/// block may become statically unreachable during optimization.
+///
+/// A forward unreachable block may appear in the dominator tree, or it may
+/// not.  If it does, dominance queries will return results as if all reachable
+/// blocks dominate it.  When asking for a Node corresponding to a potentially
+/// unreachable block, calling code must handle the case where the block was
+/// unreachable and the result of getNode() is nullptr.
+///
+/// Generally, a block known to be unreachable when the dominator tree is
+/// constructed will not be in the tree.  One which becomes unreachable after
+/// the dominator tree is initially constructed may still exist in the tree,
+/// even if the tree is properly updated. Calling code should not rely on the
+/// preceding statements; this is stated only to assist human understanding.
 class DominatorTree : public DominatorTreeBase<BasicBlock> {
 public:
   typedef DominatorTreeBase<BasicBlock> Base;
@@ -170,40 +178,31 @@ template <> struct GraphTraits<DominatorTree*>
 };
 
 /// \brief Analysis pass which computes a \c DominatorTree.
-class DominatorTreeAnalysis {
+class DominatorTreeAnalysis : public AnalysisInfoMixin<DominatorTreeAnalysis> {
+  friend AnalysisInfoMixin<DominatorTreeAnalysis>;
+  static char PassID;
+
 public:
   /// \brief Provide the result typedef for this analysis pass.
   typedef DominatorTree Result;
 
-  /// \brief Opaque, unique identifier for this analysis pass.
-  static void *ID() { return (void *)&PassID; }
-
   /// \brief Run the analysis pass over a function and produce a dominator tree.
   DominatorTree run(Function &F);
-
-  /// \brief Provide access to a name for this pass for debugging purposes.
-  static StringRef name() { return "DominatorTreeAnalysis"; }
-
-private:
-  static char PassID;
 };
 
 /// \brief Printer pass for the \c DominatorTree.
-class DominatorTreePrinterPass {
+class DominatorTreePrinterPass
+    : public PassInfoMixin<DominatorTreePrinterPass> {
   raw_ostream &OS;
 
 public:
   explicit DominatorTreePrinterPass(raw_ostream &OS);
-  PreservedAnalyses run(Function &F, AnalysisManager<Function> *AM);
-
-  static StringRef name() { return "DominatorTreePrinterPass"; }
+  PreservedAnalyses run(Function &F, AnalysisManager<Function> &AM);
 };
 
 /// \brief Verifier pass for the \c DominatorTree.
-struct DominatorTreeVerifierPass {
-  PreservedAnalyses run(Function &F, AnalysisManager<Function> *AM);
-
-  static StringRef name() { return "DominatorTreeVerifierPass"; }
+struct DominatorTreeVerifierPass : PassInfoMixin<DominatorTreeVerifierPass> {
+  PreservedAnalyses run(Function &F, AnalysisManager<Function> &AM);
 };
 
 /// \brief Legacy analysis pass which computes a \c DominatorTree.

@@ -233,7 +233,7 @@ void MipsPassConfig::addPreRegAlloc() {
 }
 
 TargetIRAnalysis MipsTargetMachine::getTargetIRAnalysis() {
-  return TargetIRAnalysis([this](Function &F) {
+  return TargetIRAnalysis([this](const Function &F) {
     if (Subtarget->allowMixed16_32()) {
       DEBUG(errs() << "No Target Transform Info Pass Added\n");
       // FIXME: This is no longer necessary as the TTI returned is per-function.
@@ -250,7 +250,13 @@ TargetIRAnalysis MipsTargetMachine::getTargetIRAnalysis() {
 // print out the code after the passes.
 void MipsPassConfig::addPreEmitPass() {
   MipsTargetMachine &TM = getMipsTargetMachine();
+
+  // The delay slot filler pass can potientially create forbidden slot (FS)
+  // hazards for MIPSR6 which the hazard schedule pass (HSP) will fix. Any
+  // (new) pass that creates compact branches after the HSP must handle FS
+  // hazards itself or be pipelined before the HSP.
   addPass(createMipsDelaySlotFillerPass(TM));
+  addPass(createMipsHazardSchedule());
   addPass(createMipsLongBranchPass(TM));
   addPass(createMipsConstantIslandPass(TM));
 }

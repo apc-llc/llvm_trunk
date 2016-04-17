@@ -19,6 +19,7 @@
 #include "llvm/MC/MCDirectives.h"
 #include "llvm/MC/MCDwarf.h"
 #include "llvm/MC/MCLinkerOptimizationHint.h"
+#include "llvm/MC/MCSymbol.h"
 #include "llvm/MC/MCWinEH.h"
 #include "llvm/Support/DataTypes.h"
 #include "llvm/Support/SMLoc.h"
@@ -33,7 +34,6 @@ class MCInst;
 class MCInstPrinter;
 class MCSection;
 class MCStreamer;
-class MCSymbol;
 class MCSymbolELF;
 class MCSymbolRefExpr;
 class MCSubtargetInfo;
@@ -131,10 +131,14 @@ public:
 
   void finish() override;
 
+  /// Reset any state between object emissions, i.e. the equivalent of
+  /// MCStreamer's reset method.
+  virtual void reset();
+
   /// Callback used to implement the ldr= pseudo.
   /// Add a new entry to the constant pool for the current section and return an
   /// MCExpr that can be used to refer to the constant pool location.
-  const MCExpr *addConstantPoolEntry(const MCExpr *);
+  const MCExpr *addConstantPoolEntry(const MCExpr *, SMLoc Loc);
 
   /// Callback used to implemnt the .ltorg directive.
   /// Emit contents of constant pool for the current section.
@@ -217,6 +221,8 @@ public:
   ArrayRef<MCDwarfFrameInfo> getDwarfFrameInfos() const {
     return DwarfFrameInfos;
   }
+
+  bool hasUnfinishedDwarfFrameInfo();
 
   unsigned getNumWinFrameInfos() { return WinFrameInfos.size(); }
   ArrayRef<WinEH::FrameInfo *> getWinFrameInfos() const {
@@ -358,7 +364,7 @@ public:
   ///
   /// Each emitted symbol will be tracked in the ordering table,
   /// so we can sort on them later.
-  void AssignSection(MCSymbol *Symbol, MCSection *Section);
+  void AssignFragment(MCSymbol *Symbol, MCFragment *Fragment);
 
   /// \brief Emit a label for \p Symbol into the current section.
   ///
@@ -522,10 +528,9 @@ public:
   /// match a native machine width.
   /// \param Loc - The location of the expression for error reporting.
   virtual void EmitValueImpl(const MCExpr *Value, unsigned Size,
-                             const SMLoc &Loc = SMLoc());
+                             SMLoc Loc = SMLoc());
 
-  void EmitValue(const MCExpr *Value, unsigned Size,
-                 const SMLoc &Loc = SMLoc());
+  void EmitValue(const MCExpr *Value, unsigned Size, SMLoc Loc = SMLoc());
 
   /// \brief Special case of EmitValue that avoids the client having
   /// to pass in a MCExpr for constant integers.
@@ -568,7 +573,7 @@ public:
 
   /// \brief Emit NumBytes worth of zeros.
   /// This function properly handles data in virtual sections.
-  virtual void EmitZeros(uint64_t NumBytes);
+  void EmitZeros(uint64_t NumBytes);
 
   /// \brief Emit some number of copies of \p Value until the byte alignment \p
   /// ByteAlignment is reached.
@@ -612,9 +617,7 @@ public:
   /// \param Offset - The offset to reach. This may be an expression, but the
   /// expression must be associated with the current section.
   /// \param Value - The value to use when filling bytes.
-  /// \return false on success, true if the offset was invalid.
-  virtual bool EmitValueToOffset(const MCExpr *Offset,
-                                 unsigned char Value = 0);
+  virtual void emitValueToOffset(const MCExpr *Offset, unsigned char Value = 0);
 
   /// @}
 
@@ -639,6 +642,40 @@ public:
                                      unsigned Isa, unsigned Discriminator,
                                      StringRef FileName);
 
+  /// \brief Associate a filename with a specified logical file number.  This
+  /// implements the '.cv_file 4 "foo.c"' assembler directive.
+  virtual unsigned EmitCVFileDirective(unsigned FileNo, StringRef Filename);
+
+  /// \brief This implements the CodeView '.cv_loc' assembler directive.
+  virtual void EmitCVLocDirective(unsigned FunctionId, unsigned FileNo,
+                                  unsigned Line, unsigned Column,
+                                  bool PrologueEnd, bool IsStmt,
+                                  StringRef FileName);
+
+  /// \brief This implements the CodeView '.cv_linetable' assembler directive.
+  virtual void EmitCVLinetableDirective(unsigned FunctionId,
+                                        const MCSymbol *FnStart,
+                                        const MCSymbol *FnEnd);
+
+  /// \brief This implements the CodeView '.cv_inline_linetable' assembler
+  /// directive.
+  virtual void EmitCVInlineLinetableDirective(
+      unsigned PrimaryFunctionId, unsigned SourceFileId, unsigned SourceLineNum,
+      const MCSymbol *FnStartSym, const MCSymbol *FnEndSym,
+      ArrayRef<unsigned> SecondaryFunctionIds);
+
+  /// \brief This implements the CodeView '.cv_def_range' assembler
+  /// directive.
+  virtual void EmitCVDefRangeDirective(
+      ArrayRef<std::pair<const MCSymbol *, const MCSymbol *>> Ranges,
+      StringRef FixedSizePortion);
+
+  /// \brief This implements the CodeView '.cv_stringtable' assembler directive.
+  virtual void EmitCVStringTableDirective() {}
+
+  /// \brief This implements the CodeView '.cv_filechecksums' assembler directive.
+  virtual void EmitCVFileChecksumsDirective() {}
+
   /// Emit the absolute difference between two symbols.
   ///
   /// \pre Offset of \c Hi is greater than the offset \c Lo.
@@ -662,6 +699,7 @@ public:
   virtual void EmitCFIRelOffset(int64_t Register, int64_t Offset);
   virtual void EmitCFIAdjustCfaOffset(int64_t Adjustment);
   virtual void EmitCFIEscape(StringRef Values);
+  virtual void EmitCFIGnuArgsSize(int64_t Size);
   virtual void EmitCFISignalFrame();
   virtual void EmitCFIUndefined(int64_t Register);
   virtual void EmitCFIRegister(int64_t Register1, int64_t Register2);
@@ -684,6 +722,14 @@ public:
 
   virtual void EmitSyntaxDirective();
 
+  /// \brief Emit a .reloc directive.
+  /// Returns true if the relocation could not be emitted because Name is not
+  /// known.
+  virtual bool EmitRelocDirective(const MCExpr &Offset, StringRef Name,
+                                  const MCExpr *Expr, SMLoc Loc) {
+    return true;
+  }
+
   /// \brief Emit the given \p Instruction into the current section.
   virtual void EmitInstruction(const MCInst &Inst, const MCSubtargetInfo &STI);
 
@@ -705,9 +751,6 @@ public:
   /// specified string in the output .s file.  This capability is indicated by
   /// the hasRawTextSupport() predicate.  By default this aborts.
   void EmitRawText(const Twine &String);
-
-  /// \brief Causes any cached state to be written out.
-  virtual void Flush() {}
 
   /// \brief Streamer specific finalization.
   virtual void FinishImpl();

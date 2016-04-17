@@ -15,7 +15,10 @@
 #define LLVM_CODEGEN_MACHINEBASICBLOCK_H
 
 #include "llvm/ADT/GraphTraits.h"
+#include "llvm/ADT/iterator_range.h"
+#include "llvm/CodeGen/MachineInstrBundleIterator.h"
 #include "llvm/CodeGen/MachineInstr.h"
+#include "llvm/Support/BranchProbability.h"
 #include "llvm/MC/MCRegisterInfo.h"
 #include "llvm/Support/DataTypes.h"
 #include <functional>
@@ -31,6 +34,9 @@ class SlotIndexes;
 class StringRef;
 class raw_ostream;
 class MachineBranchProbabilityInfo;
+
+// Forward declaration to avoid circular include problem with TargetRegisterInfo
+typedef unsigned LaneBitmask;
 
 template <>
 struct ilist_traits<MachineInstr> : public ilist_default_traits<MachineInstr> {
@@ -54,14 +60,29 @@ public:
   void addNodeToList(MachineInstr* N);
   void removeNodeFromList(MachineInstr* N);
   void transferNodesFromList(ilist_traits &SrcTraits,
-                             ilist_iterator<MachineInstr> first,
-                             ilist_iterator<MachineInstr> last);
+                             ilist_iterator<MachineInstr> First,
+                             ilist_iterator<MachineInstr> Last);
   void deleteNode(MachineInstr *N);
 private:
   void createNode(const MachineInstr &);
 };
 
-class MachineBasicBlock : public ilist_node<MachineBasicBlock> {
+class MachineBasicBlock
+    : public ilist_node_with_parent<MachineBasicBlock, MachineFunction> {
+public:
+  /// Pair of physical register and lane mask.
+  /// This is not simply a std::pair typedef because the members should be named
+  /// clearly as they both have an integer type.
+  struct RegisterMaskPair {
+  public:
+    MCPhysReg PhysReg;
+    LaneBitmask LaneMask;
+
+    RegisterMaskPair(MCPhysReg PhysReg, LaneBitmask LaneMask)
+        : PhysReg(PhysReg), LaneMask(LaneMask) {}
+  };
+
+private:
   typedef ilist<MachineInstr> Instructions;
   Instructions Insts;
   const BasicBlock *BB;
@@ -72,15 +93,16 @@ class MachineBasicBlock : public ilist_node<MachineBasicBlock> {
   std::vector<MachineBasicBlock *> Predecessors;
   std::vector<MachineBasicBlock *> Successors;
 
-  /// Keep track of the weights to the successors. This vector has the same
-  /// order as Successors, or it is empty if we don't use it (disable
+  /// Keep track of the probabilities to the successors. This vector has the
+  /// same order as Successors, or it is empty if we don't use it (disable
   /// optimization).
-  std::vector<uint32_t> Weights;
-  typedef std::vector<uint32_t>::iterator weight_iterator;
-  typedef std::vector<uint32_t>::const_iterator const_weight_iterator;
+  std::vector<BranchProbability> Probs;
+  typedef std::vector<BranchProbability>::iterator probability_iterator;
+  typedef std::vector<BranchProbability>::const_iterator
+      const_probability_iterator;
 
   /// Keep track of the physical registers that are livein of the basicblock.
-  typedef std::vector<MCPhysReg> LiveInVector;
+  typedef std::vector<RegisterMaskPair> LiveInVector;
   LiveInVector LiveIns;
 
   /// Alignment of the basic block. Zero if the basic block does not need to be
@@ -97,6 +119,9 @@ class MachineBasicBlock : public ilist_node<MachineBasicBlock> {
   /// Indicate that this basic block is the entry block of an EH funclet.
   bool IsEHFuncletEntry = false;
 
+  /// Indicate that this basic block is the entry block of a cleanup funclet.
+  bool IsCleanupFuncletEntry = false;
+
   /// \brief since getSymbol is a relatively heavy-weight operation, the symbol
   /// is only computed once and is cached.
   mutable MCSymbol *CachedMCSymbol = nullptr;
@@ -104,7 +129,7 @@ class MachineBasicBlock : public ilist_node<MachineBasicBlock> {
   // Intrusive list support
   MachineBasicBlock() {}
 
-  explicit MachineBasicBlock(MachineFunction &mf, const BasicBlock *bb);
+  explicit MachineBasicBlock(MachineFunction &MF, const BasicBlock *BB);
 
   ~MachineBasicBlock();
 
@@ -134,80 +159,14 @@ public:
   const MachineFunction *getParent() const { return xParent; }
   MachineFunction *getParent() { return xParent; }
 
-  /// MachineBasicBlock iterator that automatically skips over MIs that are
-  /// inside bundles (i.e. walk top level MIs only).
-  template<typename Ty, typename IterTy>
-  class bundle_iterator
-    : public std::iterator<std::bidirectional_iterator_tag, Ty, ptrdiff_t> {
-    IterTy MII;
-
-  public:
-    bundle_iterator(IterTy mii) : MII(mii) {}
-
-    bundle_iterator(Ty &mi) : MII(mi) {
-      assert(!mi.isBundledWithPred() &&
-             "It's not legal to initialize bundle_iterator with a bundled MI");
-    }
-    bundle_iterator(Ty *mi) : MII(mi) {
-      assert((!mi || !mi->isBundledWithPred()) &&
-             "It's not legal to initialize bundle_iterator with a bundled MI");
-    }
-    // Template allows conversion from const to nonconst.
-    template<class OtherTy, class OtherIterTy>
-    bundle_iterator(const bundle_iterator<OtherTy, OtherIterTy> &I)
-      : MII(I.getInstrIterator()) {}
-    bundle_iterator() : MII(nullptr) {}
-
-    Ty &operator*() const { return *MII; }
-    Ty *operator->() const { return &operator*(); }
-
-    operator Ty*() const { return MII; }
-
-    bool operator==(const bundle_iterator &x) const {
-      return MII == x.MII;
-    }
-    bool operator!=(const bundle_iterator &x) const {
-      return !operator==(x);
-    }
-
-    // Increment and decrement operators...
-    bundle_iterator &operator--() {      // predecrement - Back up
-      do --MII;
-      while (MII->isBundledWithPred());
-      return *this;
-    }
-    bundle_iterator &operator++() {      // preincrement - Advance
-      while (MII->isBundledWithSucc())
-        ++MII;
-      ++MII;
-      return *this;
-    }
-    bundle_iterator operator--(int) {    // postdecrement operators...
-      bundle_iterator tmp = *this;
-      --*this;
-      return tmp;
-    }
-    bundle_iterator operator++(int) {    // postincrement operators...
-      bundle_iterator tmp = *this;
-      ++*this;
-      return tmp;
-    }
-
-    IterTy getInstrIterator() const {
-      return MII;
-    }
-  };
-
   typedef Instructions::iterator                                 instr_iterator;
   typedef Instructions::const_iterator                     const_instr_iterator;
   typedef std::reverse_iterator<instr_iterator>          reverse_instr_iterator;
   typedef
   std::reverse_iterator<const_instr_iterator>      const_reverse_instr_iterator;
 
-  typedef
-  bundle_iterator<MachineInstr,instr_iterator>                         iterator;
-  typedef
-  bundle_iterator<const MachineInstr,const_instr_iterator>       const_iterator;
+  typedef MachineInstrBundleIterator<MachineInstr> iterator;
+  typedef MachineInstrBundleIterator<const MachineInstr> const_iterator;
   typedef std::reverse_iterator<const_iterator>          const_reverse_iterator;
   typedef std::reverse_iterator<iterator>                      reverse_iterator;
 
@@ -234,6 +193,13 @@ public:
   reverse_instr_iterator       instr_rend  ()       { return Insts.rend();   }
   const_reverse_instr_iterator instr_rend  () const { return Insts.rend();   }
 
+  typedef iterator_range<instr_iterator> instr_range;
+  typedef iterator_range<const_instr_iterator> const_instr_range;
+  instr_range instrs() { return instr_range(instr_begin(), instr_end()); }
+  const_instr_range instrs() const {
+    return const_instr_range(instr_begin(), instr_end());
+  }
+
   iterator                begin()       { return instr_begin();  }
   const_iterator          begin() const { return instr_begin();  }
   iterator                end  ()       { return instr_end();    }
@@ -243,11 +209,16 @@ public:
   reverse_iterator       rend  ()       { return instr_rend();   }
   const_reverse_iterator rend  () const { return instr_rend();   }
 
+  /// Support for MachineInstr::getNextNode().
+  static Instructions MachineBasicBlock::*getSublistAccess(MachineInstr *) {
+    return &MachineBasicBlock::Insts;
+  }
+
   inline iterator_range<iterator> terminators() {
-    return iterator_range<iterator>(getFirstTerminator(), end());
+    return make_range(getFirstTerminator(), end());
   }
   inline iterator_range<const_iterator> terminators() const {
-    return iterator_range<const_iterator>(getFirstTerminator(), end());
+    return make_range(getFirstTerminator(), end());
   }
 
   // Machine-CFG iterators
@@ -297,16 +268,16 @@ public:
   bool                 succ_empty() const { return Successors.empty();   }
 
   inline iterator_range<pred_iterator> predecessors() {
-    return iterator_range<pred_iterator>(pred_begin(), pred_end());
+    return make_range(pred_begin(), pred_end());
   }
   inline iterator_range<const_pred_iterator> predecessors() const {
-    return iterator_range<const_pred_iterator>(pred_begin(), pred_end());
+    return make_range(pred_begin(), pred_end());
   }
   inline iterator_range<succ_iterator> successors() {
-    return iterator_range<succ_iterator>(succ_begin(), succ_end());
+    return make_range(succ_begin(), succ_end());
   }
   inline iterator_range<const_succ_iterator> successors() const {
-    return iterator_range<const_succ_iterator>(succ_begin(), succ_end());
+    return make_range(succ_begin(), succ_end());
   }
 
   // LiveIn management methods.
@@ -314,15 +285,17 @@ public:
   /// Adds the specified register as a live in. Note that it is an error to add
   /// the same register to the same set more than once unless the intention is
   /// to call sortUniqueLiveIns after all registers are added.
-  void addLiveIn(MCPhysReg PhysReg) { LiveIns.push_back(PhysReg); }
+  void addLiveIn(MCPhysReg PhysReg, LaneBitmask LaneMask = ~0u) {
+    LiveIns.push_back(RegisterMaskPair(PhysReg, LaneMask));
+  }
+  void addLiveIn(const RegisterMaskPair &RegMaskPair) {
+    LiveIns.push_back(RegMaskPair);
+  }
 
   /// Sorts and uniques the LiveIns vector. It can be significantly faster to do
   /// this than repeatedly calling isLiveIn before calling addLiveIn for every
   /// LiveIn insertion.
-  void sortUniqueLiveIns() {
-    std::sort(LiveIns.begin(), LiveIns.end());
-    LiveIns.erase(std::unique(LiveIns.begin(), LiveIns.end()), LiveIns.end());
-  }
+  void sortUniqueLiveIns();
 
   /// Add PhysReg as live in to this block, and ensure that there is a copy of
   /// PhysReg to a virtual register of class RC. Return the virtual register
@@ -330,10 +303,10 @@ public:
   unsigned addLiveIn(MCPhysReg PhysReg, const TargetRegisterClass *RC);
 
   /// Remove the specified register from the live in set.
-  void removeLiveIn(MCPhysReg Reg);
+  void removeLiveIn(MCPhysReg Reg, LaneBitmask LaneMask = ~0u);
 
   /// Return true if the specified register is in the live in set.
-  bool isLiveIn(MCPhysReg Reg) const;
+  bool isLiveIn(MCPhysReg Reg, LaneBitmask LaneMask = ~0u) const;
 
   // Iteration support for live in sets.  These sets are kept in sorted
   // order by their register number.
@@ -344,6 +317,14 @@ public:
   iterator_range<livein_iterator> liveins() const {
     return make_range(livein_begin(), livein_end());
   }
+
+  /// Get the clobber mask for the start of this basic block. Funclets use this
+  /// to prevent register allocation across funclet transitions.
+  const uint32_t *getBeginClobberMask(const TargetRegisterInfo *TRI) const;
+
+  /// Get the clobber mask for the end of the basic block.
+  /// \see getBeginClobberMask()
+  const uint32_t *getEndClobberMask(const TargetRegisterInfo *TRI) const;
 
   /// Return alignment of the basic block. The alignment is specified as
   /// log2(bytes).
@@ -365,11 +346,19 @@ public:
   /// return NULL.
   const MachineBasicBlock *getLandingPadSuccessor() const;
 
+  bool hasEHPadSuccessor() const;
+
   /// Returns true if this is the entry block of an EH funclet.
   bool isEHFuncletEntry() const { return IsEHFuncletEntry; }
 
   /// Indicates if this is the entry block of an EH funclet.
   void setIsEHFuncletEntry(bool V = true) { IsEHFuncletEntry = V; }
+
+  /// Returns true if this is the entry block of a cleanup funclet.
+  bool isCleanupFuncletEntry() const { return IsCleanupFuncletEntry; }
+
+  /// Indicates if this is the entry block of a cleanup funclet.
+  void setIsCleanupFuncletEntry(bool V = true) { IsCleanupFuncletEntry = V; }
 
   // Code Layout methods.
 
@@ -387,40 +376,68 @@ public:
 
   // Machine-CFG mutators
 
-  /// Add succ as a successor of this MachineBasicBlock.  The Predecessors list
-  /// of succ is automatically updated. WEIGHT parameter is stored in Weights
-  /// list and it may be used by MachineBranchProbabilityInfo analysis to
-  /// calculate branch probability.
+  /// Add Succ as a successor of this MachineBasicBlock.  The Predecessors list
+  /// of Succ is automatically updated. PROB parameter is stored in
+  /// Probabilities list. The default probability is set as unknown. Mixing
+  /// known and unknown probabilities in successor list is not allowed. When all
+  /// successors have unknown probabilities, 1 / N is returned as the
+  /// probability for each successor, where N is the number of successors.
   ///
   /// Note that duplicate Machine CFG edges are not allowed.
-  void addSuccessor(MachineBasicBlock *succ, uint32_t weight = 0);
+  void addSuccessor(MachineBasicBlock *Succ,
+                    BranchProbability Prob = BranchProbability::getUnknown());
 
-  /// Set successor weight of a given iterator.
-  void setSuccWeight(succ_iterator I, uint32_t weight);
+  /// Add Succ as a successor of this MachineBasicBlock.  The Predecessors list
+  /// of Succ is automatically updated. The probability is not provided because
+  /// BPI is not available (e.g. -O0 is used), in which case edge probabilities
+  /// won't be used. Using this interface can save some space.
+  void addSuccessorWithoutProb(MachineBasicBlock *Succ);
+
+  /// Set successor probability of a given iterator.
+  void setSuccProbability(succ_iterator I, BranchProbability Prob);
+
+  /// Normalize probabilities of all successors so that the sum of them becomes
+  /// one. This is usually done when the current update on this MBB is done, and
+  /// the sum of its successors' probabilities is not guaranteed to be one. The
+  /// user is responsible for the correct use of this function.
+  /// MBB::removeSuccessor() has an option to do this automatically.
+  void normalizeSuccProbs() {
+    BranchProbability::normalizeProbabilities(Probs.begin(), Probs.end());
+  }
+
+  /// Validate successors' probabilities and check if the sum of them is
+  /// approximate one. This only works in DEBUG mode.
+  void validateSuccProbs() const;
 
   /// Remove successor from the successors list of this MachineBasicBlock. The
-  /// Predecessors list of succ is automatically updated.
-  void removeSuccessor(MachineBasicBlock *succ);
+  /// Predecessors list of Succ is automatically updated.
+  /// If NormalizeSuccProbs is true, then normalize successors' probabilities
+  /// after the successor is removed.
+  void removeSuccessor(MachineBasicBlock *Succ,
+                       bool NormalizeSuccProbs = false);
 
   /// Remove specified successor from the successors list of this
-  /// MachineBasicBlock. The Predecessors list of succ is automatically updated.
+  /// MachineBasicBlock. The Predecessors list of Succ is automatically updated.
+  /// If NormalizeSuccProbs is true, then normalize successors' probabilities
+  /// after the successor is removed.
   /// Return the iterator to the element after the one removed.
-  succ_iterator removeSuccessor(succ_iterator I);
+  succ_iterator removeSuccessor(succ_iterator I,
+                                bool NormalizeSuccProbs = false);
 
-  /// Replace successor OLD with NEW and update weight info.
+  /// Replace successor OLD with NEW and update probability info.
   void replaceSuccessor(MachineBasicBlock *Old, MachineBasicBlock *New);
 
   /// Transfers all the successors from MBB to this machine basic block (i.e.,
-  /// copies all the successors fromMBB and remove all the successors from
-  /// fromMBB).
-  void transferSuccessors(MachineBasicBlock *fromMBB);
+  /// copies all the successors FromMBB and remove all the successors from
+  /// FromMBB).
+  void transferSuccessors(MachineBasicBlock *FromMBB);
 
   /// Transfers all the successors, as in transferSuccessors, and update PHI
-  /// operands in the successor blocks which refer to fromMBB to refer to this.
-  void transferSuccessorsAndUpdatePHIs(MachineBasicBlock *fromMBB);
+  /// operands in the successor blocks which refer to FromMBB to refer to this.
+  void transferSuccessorsAndUpdatePHIs(MachineBasicBlock *FromMBB);
 
-  /// Return true if any of the successors have weights attached to them.
-  bool hasSuccessorWeights() const { return !Weights.empty(); }
+  /// Return true if any of the successors have probabilities attached to them.
+  bool hasSuccessorProbabilities() const { return !Probs.empty(); }
 
   /// Return true if the specified MBB is a predecessor of this block.
   bool isPredecessor(const MachineBasicBlock *MBB) const;
@@ -476,6 +493,12 @@ public:
   iterator getLastNonDebugInstr();
   const_iterator getLastNonDebugInstr() const {
     return const_cast<MachineBasicBlock *>(this)->getLastNonDebugInstr();
+  }
+
+  /// Convenience function that returns true if the block ends in a return
+  /// instruction.
+  bool isReturnBlock() const {
+    return !empty() && back().isReturn();
   }
 
   /// Split the critical edge from this block to the given successor block, and
@@ -564,7 +587,7 @@ public:
   /// remove_instr to remove individual instructions from a bundle.
   MachineInstr *remove(MachineInstr *I) {
     assert(!I->isBundled() && "Cannot remove bundled instructions");
-    return Insts.remove(I);
+    return Insts.remove(instr_iterator(I));
   }
 
   /// Remove the possibly bundled instruction from the instruction list
@@ -618,7 +641,7 @@ public:
   /// possible that DestA and/or DestB are LandingPads.
   bool CorrectExtraCFGEdges(MachineBasicBlock *DestA,
                             MachineBasicBlock *DestB,
-                            bool isCond);
+                            bool IsCond);
 
   /// Find the next valid DebugLoc starting at MBBI, skipping any DBG_VALUE
   /// instructions.  Return UnknownLoc if there is none.
@@ -629,12 +652,9 @@ public:
 
   /// Possible outcome of a register liveness query to computeRegisterLiveness()
   enum LivenessQueryResult {
-    LQR_Live,            ///< Register is known to be live.
-    LQR_OverlappingLive, ///< Register itself is not live, but some overlapping
-                         ///< register is.
-    LQR_Dead,            ///< Register is known to be dead.
-    LQR_Unknown          ///< Register liveness not decidable from local
-                         ///< neighborhood.
+    LQR_Live,   ///< Register is known to be (at least partially) live.
+    LQR_Dead,   ///< Register is known to be fully dead.
+    LQR_Unknown ///< Register liveness not decidable from local neighborhood.
   };
 
   /// Return whether (physical) register \p Reg has been <def>ined and not
@@ -669,33 +689,33 @@ public:
 
 
 private:
-  /// Return weight iterator corresponding to the I successor iterator.
-  weight_iterator getWeightIterator(succ_iterator I);
-  const_weight_iterator getWeightIterator(const_succ_iterator I) const;
+  /// Return probability iterator corresponding to the I successor iterator.
+  probability_iterator getProbabilityIterator(succ_iterator I);
+  const_probability_iterator
+  getProbabilityIterator(const_succ_iterator I) const;
 
   friend class MachineBranchProbabilityInfo;
   friend class MIPrinter;
 
-  /// Return weight of the edge from this block to MBB. This method should NOT
-  /// be called directly, but by using getEdgeWeight method from
+  /// Return probability of the edge from this block to MBB. This method should
+  /// NOT be called directly, but by using getEdgeProbability method from
   /// MachineBranchProbabilityInfo class.
-  uint32_t getSuccWeight(const_succ_iterator Succ) const;
-
+  BranchProbability getSuccProbability(const_succ_iterator Succ) const;
 
   // Methods used to maintain doubly linked list of blocks...
   friend struct ilist_traits<MachineBasicBlock>;
 
   // Machine-CFG mutators
 
-  /// Remove pred as a predecessor of this MachineBasicBlock. Don't do this
-  /// unless you know what you're doing, because it doesn't update pred's
-  /// successors list. Use pred->addSuccessor instead.
-  void addPredecessor(MachineBasicBlock *pred);
+  /// Remove Pred as a predecessor of this MachineBasicBlock. Don't do this
+  /// unless you know what you're doing, because it doesn't update Pred's
+  /// successors list. Use Pred->addSuccessor instead.
+  void addPredecessor(MachineBasicBlock *Pred);
 
-  /// Remove pred as a predecessor of this MachineBasicBlock. Don't do this
-  /// unless you know what you're doing, because it doesn't update pred's
-  /// successors list. Use pred->removeSuccessor instead.
-  void removePredecessor(MachineBasicBlock *pred);
+  /// Remove Pred as a predecessor of this MachineBasicBlock. Don't do this
+  /// unless you know what you're doing, because it doesn't update Pred's
+  /// successors list. Use Pred->removeSuccessor instead.
+  void removePredecessor(MachineBasicBlock *Pred);
 };
 
 raw_ostream& operator<<(raw_ostream &OS, const MachineBasicBlock &MBB);

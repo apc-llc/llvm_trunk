@@ -17,7 +17,7 @@
 #include "X86Disassembler.h"
 #include "X86DisassemblerDecoder.h"
 #include "llvm/MC/MCContext.h"
-#include "llvm/MC/MCDisassembler.h"
+#include "llvm/MC/MCDisassembler/MCDisassembler.h"
 #include "llvm/MC/MCExpr.h"
 #include "llvm/MC/MCInst.h"
 #include "llvm/MC/MCInstrInfo.h"
@@ -95,11 +95,13 @@ X86GenericDisassembler::X86GenericDisassembler(
   llvm_unreachable("Invalid CPU mode");
 }
 
+namespace {
 struct Region {
   ArrayRef<uint8_t> Bytes;
   uint64_t Base;
   Region(ArrayRef<uint8_t> Bytes, uint64_t Base) : Bytes(Bytes), Base(Base) {}
 };
+} // end anonymous namespace
 
 /// A callback function that wraps the readByte method from Region.
 ///
@@ -824,15 +826,18 @@ static bool translateRM(MCInst &mcInst, const OperandSpecifier &operand,
   case TYPE_R64:
   case TYPE_Rv:
   case TYPE_MM64:
-  case TYPE_XMM:
   case TYPE_XMM32:
   case TYPE_XMM64:
   case TYPE_XMM128:
   case TYPE_XMM256:
   case TYPE_XMM512:
   case TYPE_VK1:
+  case TYPE_VK2:
+  case TYPE_VK4:
   case TYPE_VK8:
   case TYPE_VK16:
+  case TYPE_VK32:
+  case TYPE_VK64:
   case TYPE_DEBUGREG:
   case TYPE_CONTROLREG:
   case TYPE_BNDR:
@@ -905,14 +910,6 @@ static bool translateOperand(MCInst &mcInst, const OperandSpecifier &operand,
     return translateMaskRegister(mcInst, insn.writemask);
   CASE_ENCODING_RM:
     return translateRM(mcInst, operand, insn, Dis);
-  case ENCODING_CB:
-  case ENCODING_CW:
-  case ENCODING_CD:
-  case ENCODING_CP:
-  case ENCODING_CO:
-  case ENCODING_CT:
-    debug("Translation of code offsets isn't supported.");
-    return true;
   case ENCODING_IB:
   case ENCODING_IW:
   case ENCODING_ID:

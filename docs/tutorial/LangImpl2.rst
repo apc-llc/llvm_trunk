@@ -176,17 +176,17 @@ be parsed.
 .. code-block:: c++
 
 
-    /// Error* - These are little helper functions for error handling.
-    std::unique_ptr<ExprAST> Error(const char *Str) {
-      fprintf(stderr, "Error: %s\n", Str);
+    /// LogError* - These are little helper functions for error handling.
+    std::unique_ptr<ExprAST> LogError(const char *Str) {
+      fprintf(stderr, "LogError: %s\n", Str);
       return nullptr;
     }
-    std::unique_ptr<PrototypeAST> ErrorP(const char *Str) {
-      Error(Str);
+    std::unique_ptr<PrototypeAST> LogErrorP(const char *Str) {
+      LogError(Str);
       return nullptr;
     }
 
-The ``Error`` routines are simple helper routines that our parser will
+The ``LogError`` routines are simple helper routines that our parser will
 use to handle errors. The error recovery in our parser will not be the
 best and is not particular user-friendly, but it will be enough for our
 tutorial. These routines make it easier to handle errors in routines
@@ -233,7 +233,7 @@ the parenthesis operator is defined like this:
         return nullptr;
 
       if (CurTok != ')')
-        return Error("expected ')'");
+        return LogError("expected ')'");
       getNextToken(); // eat ).
       return V;
     }
@@ -241,7 +241,7 @@ the parenthesis operator is defined like this:
 This function illustrates a number of interesting things about the
 parser:
 
-1) It shows how we use the Error routines. When called, this function
+1) It shows how we use the LogError routines. When called, this function
 expects that the current token is a '(' token, but after parsing the
 subexpression, it is possible that there is no ')' waiting. For example,
 if the user types in "(4 x" instead of "(4)", the parser should emit an
@@ -288,7 +288,7 @@ function calls:
             break;
 
           if (CurTok != ',')
-            return Error("Expected ')' or ',' in argument list");
+            return LogError("Expected ')' or ',' in argument list");
           getNextToken();
         }
       }
@@ -312,7 +312,7 @@ Now that we have all of our simple expression-parsing logic in place, we
 can define a helper function to wrap it together into one entry point.
 We call this class of expressions "primary" expressions, for reasons
 that will become more clear `later in the
-tutorial <LangImpl6.html#unary>`_. In order to parse an arbitrary
+tutorial <LangImpl6.html#user-defined-unary-operators>`_. In order to parse an arbitrary
 primary expression, we need to determine what sort of expression it is:
 
 .. code-block:: c++
@@ -324,7 +324,7 @@ primary expression, we need to determine what sort of expression it is:
     static std::unique_ptr<ExprAST> ParsePrimary() {
       switch (CurTok) {
       default:
-        return Error("unknown token when expecting an expression");
+        return LogError("unknown token when expecting an expression");
       case tok_identifier:
         return ParseIdentifierExpr();
       case tok_number:
@@ -396,7 +396,7 @@ would be easy enough to eliminate the map and do the comparisons in the
 With the helper above defined, we can now start parsing binary
 expressions. The basic idea of operator precedence parsing is to break
 down an expression with potentially ambiguous binary operators into
-pieces. Consider ,for example, the expression "a+b+(c+d)\*e\*f+g".
+pieces. Consider, for example, the expression "a+b+(c+d)\*e\*f+g".
 Operator precedence parsing considers this as a stream of primary
 expressions separated by binary operators. As such, it will first parse
 the leading primary expression "a", then it will see the pairs [+, b]
@@ -571,20 +571,20 @@ expressions):
     ///   ::= id '(' id* ')'
     static std::unique_ptr<PrototypeAST> ParsePrototype() {
       if (CurTok != tok_identifier)
-        return ErrorP("Expected function name in prototype");
+        return LogErrorP("Expected function name in prototype");
 
       std::string FnName = IdentifierStr;
       getNextToken();
 
       if (CurTok != '(')
-        return ErrorP("Expected '(' in prototype");
+        return LogErrorP("Expected '(' in prototype");
 
       // Read the list of argument names.
       std::vector<std::string> ArgNames;
       while (getNextToken() == tok_identifier)
         ArgNames.push_back(IdentifierStr);
       if (CurTok != ')')
-        return ErrorP("Expected ')' in prototype");
+        return LogErrorP("Expected ')' in prototype");
 
       // success.
       getNextToken();  // eat ')'.
@@ -644,7 +644,7 @@ The Driver
 
 The driver for this simply invokes all of the parsing pieces with a
 top-level dispatch loop. There isn't much interesting here, so I'll just
-include the top-level loop. See `below <#code>`_ for full code in the
+include the top-level loop. See `below <#full-code-listing>`_ for full code in the
 "Top-Level Parsing" section.
 
 .. code-block:: c++

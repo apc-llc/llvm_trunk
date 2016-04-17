@@ -10,6 +10,7 @@
 #include "BinaryHolder.h"
 #include "DebugMap.h"
 #include "dsymutil.h"
+#include "llvm/ADT/Optional.h"
 #include "llvm/Object/MachO.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/raw_ostream.h"
@@ -53,7 +54,7 @@ private:
   /// Owns the MemoryBuffer for the currently handled object file.
   BinaryHolder CurrentObjectHolder;
   /// Map of the currently processed object file symbol addresses.
-  StringMap<uint64_t> CurrentObjectAddresses;
+  StringMap<Optional<uint64_t>> CurrentObjectAddresses;
   /// Element of the debug map corresponfing to the current object file.
   DebugMapObject *CurrentDebugMapObject;
 
@@ -96,7 +97,7 @@ private:
 };
 
 static void Warning(const Twine &Msg) { errs() << "warning: " + Msg + "\n"; }
-}
+} // anonymous namespace
 
 /// Reset the parser state coresponding to the current object
 /// file. This is to be called after an object file is finished
@@ -185,14 +186,14 @@ static const struct DarwinStabName DarwinStabNames[] = {
     {MachO::N_LBRAC, "N_LBRAC"},  {MachO::N_EXCL, "N_EXCL"},
     {MachO::N_RBRAC, "N_RBRAC"},  {MachO::N_BCOMM, "N_BCOMM"},
     {MachO::N_ECOMM, "N_ECOMM"},  {MachO::N_ECOML, "N_ECOML"},
-    {MachO::N_LENG, "N_LENG"},    {0, 0}};
+    {MachO::N_LENG, "N_LENG"},    {0, nullptr}};
 
 static const char *getDarwinStabString(uint8_t NType) {
   for (unsigned i = 0; DarwinStabNames[i].Name; i++) {
     if (DarwinStabNames[i].NType == NType)
       return DarwinStabNames[i].Name;
   }
-  return 0;
+  return nullptr;
 }
 
 void MachODebugMapParser::dumpSymTabHeader(raw_ostream &OS, StringRef Arch) {
@@ -209,7 +210,6 @@ void MachODebugMapParser::dumpSymTabEntry(raw_ostream &OS, uint64_t Index,
                                           uint32_t StringIndex, uint8_t Type,
                                           uint8_t SectionIndex, uint16_t Flags,
                                           uint64_t Value) {
-
   // Index
   OS << '[' << format_decimal(Index, 6) << "] "
      // n_strx
@@ -405,7 +405,18 @@ void MachODebugMapParser::loadCurrentObjectFileSymbols(
     ErrorOr<StringRef> Name = Sym.getName();
     if (!Name)
       continue;
-    CurrentObjectAddresses[*Name] = Addr;
+    // The value of some categories of symbols isn't meaningful. For
+    // example common symbols store their size in the value field, not
+    // their address. Absolute symbols have a fixed address that can
+    // conflict with standard symbols. These symbols (especially the
+    // common ones), might still be referenced by relocations. These
+    // relocations will use the symbol itself, and won't need an
+    // object file address. The object file address field is optional
+    // in the DebugMap, leave it unassigned for these symbols.
+    if (Sym.getFlags() & (SymbolRef::SF_Absolute | SymbolRef::SF_Common))
+      CurrentObjectAddresses[*Name] = None;
+    else
+      CurrentObjectAddresses[*Name] = Addr;
   }
 }
 
@@ -426,7 +437,10 @@ void MachODebugMapParser::loadMainBinarySymbols(
   section_iterator Section = MainBinary.section_end();
   MainBinarySymbolAddresses.clear();
   for (const auto &Sym : MainBinary.symbols()) {
-    SymbolRef::Type Type = Sym.getType();
+    ErrorOr<SymbolRef::Type> TypeOrErr = Sym.getType();
+    if (!TypeOrErr)
+      continue;
+    SymbolRef::Type Type = *TypeOrErr;
     // Skip undefined and STAB entries.
     if ((Type & SymbolRef::ST_Debug) || (Type & SymbolRef::ST_Unknown))
       continue;
@@ -471,5 +485,5 @@ bool dumpStab(StringRef InputFile, ArrayRef<std::string> Archs,
   MachODebugMapParser Parser(InputFile, Archs, PrependPath, false);
   return Parser.dumpStab();
 }
-}
-}
+} // namespace dsymutil
+} // namespace llvm

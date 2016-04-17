@@ -19,6 +19,7 @@
 #include "llvm/CodeGen/MachineCombinerPattern.h"
 #include "llvm/CodeGen/MachineFunction.h"
 #include "llvm/MC/MCInstrInfo.h"
+#include "llvm/Support/BranchProbability.h"
 #include "llvm/Target/TargetRegisterInfo.h"
 
 namespace llvm {
@@ -38,13 +39,11 @@ class SelectionDAG;
 class ScheduleDAG;
 class TargetRegisterClass;
 class TargetRegisterInfo;
-class BranchProbability;
 class TargetSubtargetInfo;
 class TargetSchedModel;
 class DFAPacketizer;
 
 template<class T> class SmallVectorImpl;
-
 
 //---------------------------------------------------------------------------
 ///
@@ -54,12 +53,17 @@ class TargetInstrInfo : public MCInstrInfo {
   TargetInstrInfo(const TargetInstrInfo &) = delete;
   void operator=(const TargetInstrInfo &) = delete;
 public:
-  TargetInstrInfo(unsigned CFSetupOpcode = ~0u, unsigned CFDestroyOpcode = ~0u)
-    : CallFrameSetupOpcode(CFSetupOpcode),
-      CallFrameDestroyOpcode(CFDestroyOpcode) {
-  }
+  TargetInstrInfo(unsigned CFSetupOpcode = ~0u, unsigned CFDestroyOpcode = ~0u,
+                  unsigned CatchRetOpcode = ~0u)
+      : CallFrameSetupOpcode(CFSetupOpcode),
+        CallFrameDestroyOpcode(CFDestroyOpcode),
+        CatchRetOpcode(CatchRetOpcode) {}
 
   virtual ~TargetInstrInfo();
+
+  static bool isGenericOpcode(unsigned Opc) {
+    return Opc <= TargetOpcode::GENERIC_OP_END;
+  }
 
   /// Given a machine instruction descriptor, returns the register
   /// class constraint for OpNum, or NULL.
@@ -94,6 +98,41 @@ protected:
     return false;
   }
 
+  /// This method commutes the operands of the given machine instruction MI.
+  /// The operands to be commuted are specified by their indices OpIdx1 and
+  /// OpIdx2.
+  ///
+  /// If a target has any instructions that are commutable but require
+  /// converting to different instructions or making non-trivial changes
+  /// to commute them, this method can be overloaded to do that.
+  /// The default implementation simply swaps the commutable operands.
+  ///
+  /// If NewMI is false, MI is modified in place and returned; otherwise, a
+  /// new machine instruction is created and returned.
+  ///
+  /// Do not call this method for a non-commutable instruction.
+  /// Even though the instruction is commutable, the method may still
+  /// fail to commute the operands, null pointer is returned in such cases.
+  virtual MachineInstr *commuteInstructionImpl(MachineInstr *MI,
+                                               bool NewMI,
+                                               unsigned OpIdx1,
+                                               unsigned OpIdx2) const;
+
+  /// Assigns the (CommutableOpIdx1, CommutableOpIdx2) pair of commutable
+  /// operand indices to (ResultIdx1, ResultIdx2).
+  /// One or both input values of the pair: (ResultIdx1, ResultIdx2) may be
+  /// predefined to some indices or be undefined (designated by the special
+  /// value 'CommuteAnyOperandIndex').
+  /// The predefined result indices cannot be re-defined.
+  /// The function returns true iff after the result pair redefinition
+  /// the fixed result pair is equal to or equivalent to the source pair of
+  /// indices: (CommutableOpIdx1, CommutableOpIdx2). It is assumed here that
+  /// the pairs (x,y) and (y,x) are equivalent.
+  static bool fixCommutedOpIndices(unsigned &ResultIdx1,
+                                   unsigned &ResultIdx2,
+                                   unsigned CommutableOpIdx1,
+                                   unsigned CommutableOpIdx2);
+
 private:
   /// For instructions with opcodes for which the M_REMATERIALIZABLE flag is
   /// set and the target hook isReallyTriviallyReMaterializable returns false,
@@ -110,6 +149,8 @@ public:
   ///
   unsigned getCallFrameSetupOpcode() const { return CallFrameSetupOpcode; }
   unsigned getCallFrameDestroyOpcode() const { return CallFrameDestroyOpcode; }
+
+  unsigned getCatchReturnOpcode() const { return CatchRetOpcode; }
 
   /// Returns the actual stack pointer adjustment made by an instruction
   /// as part of a call sequence. By default, only call frame setup/destroy
@@ -215,6 +256,18 @@ public:
     return MI->isAsCheapAsAMove();
   }
 
+  /// Return true if the instruction should be sunk by MachineSink.
+  ///
+  /// MachineSink determines on its own whether the instruction is safe to sink;
+  /// this gives the target a hook to override the default behavior with regards
+  /// to which instructions should be sunk.
+  /// The default behavior is to not sink insert_subreg, subreg_to_reg, and
+  /// reg_sequence. These are meant to be close to the source to make it easier
+  /// to coalesce.
+  virtual bool shouldSink(const MachineInstr &MI) const {
+    return !MI.isInsertSubreg() && !MI.isSubregToReg() && !MI.isRegSequence();
+  }
+
   /// Re-issue the specified 'original' instruction at the
   /// specific location targeting a new destination register.
   /// The register in Orig->getOperand(0).getReg() will be substituted by
@@ -250,20 +303,51 @@ public:
     return nullptr;
   }
 
-  /// If a target has any instructions that are commutable but require
-  /// converting to different instructions or making non-trivial changes to
-  /// commute them, this method can overloaded to do that.
-  /// The default implementation simply swaps the commutable operands.
-  /// If NewMI is false, MI is modified in place and returned; otherwise, a
-  /// new machine instruction is created and returned.  Do not call this
-  /// method for a non-commutable instruction, but there may be some cases
-  /// where this method fails and returns null.
-  virtual MachineInstr *commuteInstruction(MachineInstr *MI,
-                                           bool NewMI = false) const;
+  // This constant can be used as an input value of operand index passed to
+  // the method findCommutedOpIndices() to tell the method that the
+  // corresponding operand index is not pre-defined and that the method
+  // can pick any commutable operand.
+  static const unsigned CommuteAnyOperandIndex = ~0U;
 
-  /// If specified MI is commutable, return the two operand indices that would
-  /// swap value. Return false if the instruction
-  /// is not in a form which this routine understands.
+  /// This method commutes the operands of the given machine instruction MI.
+  ///
+  /// The operands to be commuted are specified by their indices OpIdx1 and
+  /// OpIdx2. OpIdx1 and OpIdx2 arguments may be set to a special value
+  /// 'CommuteAnyOperandIndex', which means that the method is free to choose
+  /// any arbitrarily chosen commutable operand. If both arguments are set to
+  /// 'CommuteAnyOperandIndex' then the method looks for 2 different commutable
+  /// operands; then commutes them if such operands could be found.
+  ///
+  /// If NewMI is false, MI is modified in place and returned; otherwise, a
+  /// new machine instruction is created and returned.
+  ///
+  /// Do not call this method for a non-commutable instruction or
+  /// for non-commuable operands.
+  /// Even though the instruction is commutable, the method may still
+  /// fail to commute the operands, null pointer is returned in such cases.
+  MachineInstr *
+  commuteInstruction(MachineInstr *MI,
+                     bool NewMI = false,
+                     unsigned OpIdx1 = CommuteAnyOperandIndex,
+                     unsigned OpIdx2 = CommuteAnyOperandIndex) const;
+
+  /// Returns true iff the routine could find two commutable operands in the
+  /// given machine instruction.
+  /// The 'SrcOpIdx1' and 'SrcOpIdx2' are INPUT and OUTPUT arguments.
+  /// If any of the INPUT values is set to the special value
+  /// 'CommuteAnyOperandIndex' then the method arbitrarily picks a commutable
+  /// operand, then returns its index in the corresponding argument.
+  /// If both of INPUT values are set to 'CommuteAnyOperandIndex' then method
+  /// looks for 2 commutable operands.
+  /// If INPUT values refer to some operands of MI, then the method simply
+  /// returns true if the corresponding operands are commutable and returns
+  /// false otherwise.
+  ///
+  /// For example, calling this method this way:
+  ///     unsigned Op1 = 1, Op2 = CommuteAnyOperandIndex;
+  ///     findCommutedOpIndices(MI, Op1, Op2);
+  /// can be interpreted as a query asking to find an operand that would be
+  /// commutable with the operand#1.
   virtual bool findCommutedOpIndices(MachineInstr *MI, unsigned &SrcOpIdx1,
                                      unsigned &SrcOpIdx2) const;
 
@@ -380,6 +464,8 @@ public:
   /// If AllowModify is true, then this routine is allowed to modify the basic
   /// block (e.g. delete instructions after the unconditional branch).
   ///
+  /// The CFG information in MBB.Predecessors and MBB.Successors must be valid
+  /// before calling this function.
   virtual bool AnalyzeBranch(MachineBasicBlock &MBB, MachineBasicBlock *&TBB,
                              MachineBasicBlock *&FBB,
                              SmallVectorImpl<MachineOperand> &Cond,
@@ -449,6 +535,9 @@ public:
   /// cases where AnalyzeBranch doesn't apply because there was no original
   /// branch to analyze.  At least this much must be implemented, else tail
   /// merging needs to be disabled.
+  ///
+  /// The CFG information in MBB.Predecessors and MBB.Successors must be valid
+  /// before calling this function.
   virtual unsigned InsertBranch(MachineBasicBlock &MBB, MachineBasicBlock *TBB,
                                 MachineBasicBlock *FBB,
                                 ArrayRef<MachineOperand> Cond,
@@ -511,7 +600,7 @@ public:
   virtual
   bool isProfitableToIfCvt(MachineBasicBlock &MBB, unsigned NumCycles,
                            unsigned ExtraPredCycles,
-                           const BranchProbability &Probability) const {
+                           BranchProbability Probability) const {
     return false;
   }
 
@@ -526,7 +615,7 @@ public:
                       unsigned NumTCycles, unsigned ExtraTCycles,
                       MachineBasicBlock &FMBB,
                       unsigned NumFCycles, unsigned ExtraFCycles,
-                      const BranchProbability &Probability) const {
+                      BranchProbability Probability) const {
     return false;
   }
 
@@ -538,7 +627,7 @@ public:
   /// will be properly predicted.
   virtual bool
   isProfitableToDupForIfCvt(MachineBasicBlock &MBB, unsigned NumCycles,
-                            const BranchProbability &Probability) const {
+                            BranchProbability Probability) const {
     return false;
   }
 
@@ -724,12 +813,29 @@ public:
   /// order since the pattern evaluator stops checking as soon as it finds a
   /// faster sequence.
   /// \param Root - Instruction that could be combined with one of its operands
-  /// \param Pattern - Vector of possible combination patterns
+  /// \param Patterns - Vector of possible combination patterns
   virtual bool getMachineCombinerPatterns(
       MachineInstr &Root,
-      SmallVectorImpl<MachineCombinerPattern::MC_PATTERN> &Pattern) const {
+      SmallVectorImpl<MachineCombinerPattern> &Patterns) const;
+
+  /// Return true if the input \P Inst is part of a chain of dependent ops
+  /// that are suitable for reassociation, otherwise return false.
+  /// If the instruction's operands must be commuted to have a previous
+  /// instruction of the same type define the first source operand, \P Commuted
+  /// will be set to true.
+  bool isReassociationCandidate(const MachineInstr &Inst, bool &Commuted) const;
+
+  /// Return true when \P Inst is both associative and commutative.
+  virtual bool isAssociativeAndCommutative(const MachineInstr &Inst) const {
     return false;
   }
+
+  /// Return true when \P Inst has reassociable operands in the same \P MBB.
+  virtual bool hasReassociableOperands(const MachineInstr &Inst,
+                                       const MachineBasicBlock *MBB) const;
+
+  /// Return true when \P Inst has reassociable sibling.
+  bool hasReassociableSibling(const MachineInstr &Inst, bool &Commuted) const;
 
   /// When getMachineCombinerPatterns() finds patterns, this function generates
   /// the instructions that could replace the original code sequence. The client
@@ -742,11 +848,24 @@ public:
   /// \param InstrIdxForVirtReg - map of virtual register to instruction in
   /// InsInstr that defines it
   virtual void genAlternativeCodeSequence(
-      MachineInstr &Root, MachineCombinerPattern::MC_PATTERN Pattern,
+      MachineInstr &Root, MachineCombinerPattern Pattern,
       SmallVectorImpl<MachineInstr *> &InsInstrs,
       SmallVectorImpl<MachineInstr *> &DelInstrs,
-      DenseMap<unsigned, unsigned> &InstrIdxForVirtReg) const {
-    return;
+      DenseMap<unsigned, unsigned> &InstrIdxForVirtReg) const;
+
+  /// Attempt to reassociate \P Root and \P Prev according to \P Pattern to
+  /// reduce critical path length.
+  void reassociateOps(MachineInstr &Root, MachineInstr &Prev,
+                      MachineCombinerPattern Pattern,
+                      SmallVectorImpl<MachineInstr *> &InsInstrs,
+                      SmallVectorImpl<MachineInstr *> &DelInstrs,
+                      DenseMap<unsigned, unsigned> &InstrIdxForVirtReg) const;
+
+  /// This is an architecture-specific helper function of reassociateOps.
+  /// Set special operand attributes for new instructions after reassociation.
+  virtual void setSpecialOperandAttr(MachineInstr &OldMI1, MachineInstr &OldMI2,
+                                     MachineInstr &NewMI1,
+                                     MachineInstr &NewMI2) const {
   }
 
   /// Return true when a target supports MachineCombiner.
@@ -871,16 +990,18 @@ public:
   /// Get the base register and byte offset of an instruction that reads/writes
   /// memory.
   virtual bool getMemOpBaseRegImmOfs(MachineInstr *MemOp, unsigned &BaseReg,
-                                     unsigned &Offset,
+                                     int64_t &Offset,
                                      const TargetRegisterInfo *TRI) const {
     return false;
   }
 
   virtual bool enableClusterLoads() const { return false; }
 
-  virtual bool shouldClusterLoads(MachineInstr *FirstLdSt,
-                                  MachineInstr *SecondLdSt,
-                                  unsigned NumLoads) const {
+  virtual bool enableClusterStores() const { return false; }
+
+  virtual bool shouldClusterMemOps(MachineInstr *FirstLdSt,
+                                   MachineInstr *SecondLdSt,
+                                   unsigned NumLoads) const {
     return false;
   }
 
@@ -908,19 +1029,18 @@ public:
 
 
   /// Returns true if the instruction is already predicated.
-  virtual bool isPredicated(const MachineInstr *MI) const {
+  virtual bool isPredicated(const MachineInstr &MI) const {
     return false;
   }
 
   /// Returns true if the instruction is a
   /// terminator instruction that has not been predicated.
-  virtual bool isUnpredicatedTerminator(const MachineInstr *MI) const;
+  virtual bool isUnpredicatedTerminator(const MachineInstr &MI) const;
 
   /// Convert the instruction into a predicated instruction.
   /// It returns true if the operation was successful.
-  virtual
-  bool PredicateInstruction(MachineInstr *MI,
-                            ArrayRef<MachineOperand> Pred) const;
+  virtual bool PredicateInstruction(MachineInstr &MI,
+                                    ArrayRef<MachineOperand> Pred) const;
 
   /// Returns true if the first specified predicate
   /// subsumes the second, e.g. GE subsumes GT.
@@ -933,7 +1053,7 @@ public:
   /// If the specified instruction defines any predicate
   /// or condition code register(s) used for predication, returns true as well
   /// as the definition predicate(s) by reference.
-  virtual bool DefinesPredicate(MachineInstr *MI,
+  virtual bool DefinesPredicate(MachineInstr &MI,
                                 std::vector<MachineOperand> &Pred) const {
     return false;
   }
@@ -941,8 +1061,8 @@ public:
   /// Return true if the specified instruction can be predicated.
   /// By default, this returns true for every instruction with a
   /// PredicateOperand.
-  virtual bool isPredicable(MachineInstr *MI) const {
-    return MI->getDesc().isPredicable();
+  virtual bool isPredicable(MachineInstr &MI) const {
+    return MI.getDesc().isPredicable();
   }
 
   /// Return true if it's safe to move a machine
@@ -1076,7 +1196,7 @@ public:
                                    const MachineInstr *MI,
                                    unsigned *PredCost = nullptr) const;
 
-  virtual unsigned getPredicationCost(const MachineInstr *MI) const;
+  virtual unsigned getPredicationCost(const MachineInstr &MI) const;
 
   virtual int getInstrLatency(const InstrItineraryData *ItinData,
                               SDNode *Node) const;
@@ -1145,7 +1265,6 @@ public:
   /// The bit (1 << Domain) must be set in the mask returned from
   /// getExecutionDomain(MI).
   virtual void setExecutionDomain(MachineInstr *MI, unsigned Domain) const {}
-
 
   /// Returns the preferred minimum clearance
   /// before an instruction with an unwanted partial register update.
@@ -1301,6 +1420,7 @@ public:
 
 private:
   unsigned CallFrameSetupOpcode, CallFrameDestroyOpcode;
+  unsigned CatchRetOpcode;
 };
 
 /// \brief Provide DenseMapInfo for TargetInstrInfo::RegSubRegPair.
@@ -1330,6 +1450,6 @@ struct DenseMapInfo<TargetInstrInfo::RegSubRegPair> {
   }
 };
 
-} // End llvm namespace
+} // end namespace llvm
 
-#endif
+#endif // LLVM_TARGET_TARGETINSTRINFO_H

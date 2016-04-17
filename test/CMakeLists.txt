@@ -19,11 +19,12 @@ endif()
 # Set the depends list as a variable so that it can grow conditionally.
 # NOTE: Sync the substitutions in test/lit.cfg when adding to this list.
 set(LLVM_TEST_DEPENDS
-          llvm-config
-          UnitTests
           BugpointPasses
+          FileCheck
           LLVMHello
+          UnitTests
           bugpoint
+          count
           llc
           lli
           lli-child-target
@@ -31,12 +32,14 @@ set(LLVM_TEST_DEPENDS
           llvm-as
           llvm-bcanalyzer
           llvm-c-test
+          llvm-config
           llvm-cov
           llvm-cxxdump
           llvm-diff
           llvm-dis
           llvm-dsymutil
           llvm-dwarfdump
+          llvm-dwp
           llvm-extract
           llvm-lib
           llvm-link
@@ -45,6 +48,7 @@ set(LLVM_TEST_DEPENDS
           llvm-mcmarkup
           llvm-nm
           llvm-objdump
+          llvm-pdbdump
           llvm-profdata
           llvm-ranlib
           llvm-readobj
@@ -53,15 +57,14 @@ set(LLVM_TEST_DEPENDS
           llvm-split
           llvm-symbolizer
           llvm-tblgen
-          macho-dump
-          opt
-          FileCheck
-          count
           not
+          obj2yaml
+          opt
+          sancov
+          sanstats
+          verify-uselistorder
           yaml-bench
           yaml2obj
-          obj2yaml
-          verify-uselistorder
         )
 
 # If Intel JIT events are supported, depend on a tool that tests the listener.
@@ -109,6 +112,9 @@ if(LLVM_BUILD_EXAMPLES)
     Kaleidoscope-Ch7
     )
 endif()
+
+add_custom_target(llvm-test-depends DEPENDS ${LLVM_TEST_DEPENDS})
+set_target_properties(llvm-test-depends PROPERTIES FOLDER "Tests")
 
 add_lit_testsuite(check-llvm "Running the LLVM regression tests"
   ${CMAKE_CURRENT_BINARY_DIR}

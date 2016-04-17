@@ -64,7 +64,7 @@ LiveVariables::VarInfo::findKill(const MachineBasicBlock *MBB) const {
   return nullptr;
 }
 
-void LiveVariables::VarInfo::dump() const {
+LLVM_DUMP_METHOD void LiveVariables::VarInfo::dump() const {
 #if !defined(NDEBUG) || defined(LLVM_ENABLE_DUMP)
   dbgs() << "  Alive in blocks: ";
   for (SparseBitVector<>::iterator I = AliveBlocks.begin(),
@@ -522,11 +522,18 @@ void LiveVariables::runOnInstr(MachineInstr *MI,
       continue;
     unsigned MOReg = MO.getReg();
     if (MO.isUse()) {
-      MO.setIsKill(false);
+      if (!(TargetRegisterInfo::isPhysicalRegister(MOReg) &&
+            MRI->isReserved(MOReg)))
+        MO.setIsKill(false);
       if (MO.readsReg())
         UseRegs.push_back(MOReg);
-    } else /*MO.isDef()*/ {
-      MO.setIsDead(false);
+    } else {
+      assert(MO.isDef());
+      // FIXME: We should not remove any dead flags. However the MIPS RDDSP
+      // instruction needs it at the moment: http://llvm.org/PR27116.
+      if (TargetRegisterInfo::isPhysicalRegister(MOReg) &&
+          !MRI->isReserved(MOReg))
+        MO.setIsDead(false);
       DefRegs.push_back(MOReg);
     }
   }
@@ -559,10 +566,10 @@ void LiveVariables::runOnInstr(MachineInstr *MI,
 void LiveVariables::runOnBlock(MachineBasicBlock *MBB, const unsigned NumRegs) {
   // Mark live-in registers as live-in.
   SmallVector<unsigned, 4> Defs;
-  for (unsigned LI : MBB->liveins()) {
-    assert(TargetRegisterInfo::isPhysicalRegister(LI) &&
+  for (const auto &LI : MBB->liveins()) {
+    assert(TargetRegisterInfo::isPhysicalRegister(LI.PhysReg) &&
            "Cannot have a live-in virtual register!");
-    HandlePhysRegDef(LI, nullptr, Defs);
+    HandlePhysRegDef(LI.PhysReg, nullptr, Defs);
   }
 
   // Loop over all of the instructions, processing them.
@@ -600,10 +607,10 @@ void LiveVariables::runOnBlock(MachineBasicBlock *MBB, const unsigned NumRegs) {
     MachineBasicBlock *SuccMBB = *SI;
     if (SuccMBB->isEHPad())
       continue;
-    for (unsigned LI : SuccMBB->liveins()) {
-      if (!TRI->isInAllocatableClass(LI))
+    for (const auto &LI : SuccMBB->liveins()) {
+      if (!TRI->isInAllocatableClass(LI.PhysReg))
         // Ignore other live-ins, e.g. those that are live into landing pads.
-        LiveOuts.insert(LI);
+        LiveOuts.insert(LI.PhysReg);
     }
   }
 
@@ -637,7 +644,7 @@ bool LiveVariables::runOnMachineFunction(MachineFunction &mf) {
   // function.  This guarantees that we will see the definition of a virtual
   // register before its uses due to dominance properties of SSA (except for PHI
   // nodes, which are treated as a special case).
-  MachineBasicBlock *Entry = MF->begin();
+  MachineBasicBlock *Entry = &MF->front();
   SmallPtrSet<MachineBasicBlock*,16> Visited;
 
   for (MachineBasicBlock *MBB : depth_first_ext(Entry, Visited)) {

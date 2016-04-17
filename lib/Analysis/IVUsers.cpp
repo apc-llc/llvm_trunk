@@ -276,7 +276,7 @@ bool IVUsers::runOnLoop(Loop *l, LPPassManager &LPM) {
   // them by stride.  Start by finding all of the PHI nodes in the header for
   // this loop.  If they are induction variables, inspect their uses.
   for (BasicBlock::iterator I = L->getHeader()->begin(); isa<PHINode>(I); ++I)
-    (void)AddUsersIfInteresting(I);
+    (void)AddUsersIfInteresting(&*I);
 
   return false;
 }
@@ -312,7 +312,7 @@ void IVUsers::print(raw_ostream &OS, const Module *M) const {
 }
 
 #if !defined(NDEBUG) || defined(LLVM_ENABLE_DUMP)
-void IVUsers::dump() const {
+LLVM_DUMP_METHOD void IVUsers::dump() const {
   print(dbgs());
 }
 #endif

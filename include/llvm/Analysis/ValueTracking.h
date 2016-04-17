@@ -16,6 +16,7 @@
 #define LLVM_ANALYSIS_VALUETRACKING_H
 
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/IR/ConstantRange.h"
 #include "llvm/IR/Instruction.h"
 #include "llvm/Support/DataTypes.h"
 
@@ -25,6 +26,7 @@ namespace llvm {
   class AssumptionCache;
   class DataLayout;
   class DominatorTree;
+  class GEPOperator;
   class Instruction;
   class Loop;
   class LoopInfo;
@@ -48,8 +50,9 @@ namespace llvm {
                         const DominatorTree *DT = nullptr);
   /// Compute known bits from the range metadata.
   /// \p KnownZero the set of bits that are known to be zero
+  /// \p KnownOne the set of bits that are known to be one
   void computeKnownBitsFromRangeMetadata(const MDNode &Ranges,
-                                         APInt &KnownZero);
+                                         APInt &KnownZero, APInt &KnownOne);
   /// Return true if LHS and RHS have no common bits set.
   bool haveNoCommonBitsSet(Value *LHS, Value *RHS, const DataLayout &DL,
                            AssumptionCache *AC = nullptr,
@@ -90,6 +93,20 @@ namespace llvm {
                           const Instruction *CxtI = nullptr,
                           const DominatorTree *DT = nullptr);
 
+  /// Returns true if the given value is known be positive (i.e. non-negative
+  /// and non-zero).
+  bool isKnownPositive(Value *V, const DataLayout &DL, unsigned Depth = 0,
+                       AssumptionCache *AC = nullptr,
+                       const Instruction *CxtI = nullptr,
+                       const DominatorTree *DT = nullptr);
+
+  /// isKnownNonEqual - Return true if the given values are known to be
+  /// non-equal when defined. Supports scalar integer types only.
+  bool isKnownNonEqual(Value *V1, Value *V2, const DataLayout &DL,
+                      AssumptionCache *AC = nullptr,
+                      const Instruction *CxtI = nullptr,
+                      const DominatorTree *DT = nullptr);
+
   /// MaskedValueIsZero - Return true if 'V & Mask' is known to be zero.  We use
   /// this predicate to simplify operations downstream.  Mask is known to be
   /// zero for bits that V cannot have.
@@ -126,15 +143,17 @@ namespace llvm {
                        bool LookThroughSExt = false,
                        unsigned Depth = 0);
 
-  /// CannotBeNegativeZero - Return true if we can prove that the specified FP 
+  /// CannotBeNegativeZero - Return true if we can prove that the specified FP
   /// value is never equal to -0.0.
   ///
-  bool CannotBeNegativeZero(const Value *V, unsigned Depth = 0);
+  bool CannotBeNegativeZero(const Value *V, const TargetLibraryInfo *TLI,
+                            unsigned Depth = 0);
 
-  /// CannotBeOrderedLessThanZero - Return true if we can prove that the 
+  /// CannotBeOrderedLessThanZero - Return true if we can prove that the
   /// specified FP value is either a NaN or never less than 0.0.
   ///
-  bool CannotBeOrderedLessThanZero(const Value *V, unsigned Depth = 0);
+  bool CannotBeOrderedLessThanZero(const Value *V, const TargetLibraryInfo *TLI,
+                                   unsigned Depth = 0);
 
   /// isBytewiseValue - If the specified value can be set by repeating the same
   /// byte in memory, return the i8 value that it is represented with.  This is
@@ -142,7 +161,7 @@ namespace llvm {
   /// i16 0xF0F0, double 0.0 etc.  If the value can't be handled with a repeated
   /// byte store (e.g. i16 0x1234), return null.
   Value *isBytewiseValue(Value *V);
-    
+
   /// FindInsertedValue - Given an aggregrate and an sequence of indices, see if
   /// the scalar value indexed is already around as a register, for example if
   /// it were inserted directly into the aggregrate.
@@ -164,7 +183,11 @@ namespace llvm {
     return GetPointerBaseWithConstantOffset(const_cast<Value *>(Ptr), Offset,
                                             DL);
   }
-  
+
+  /// Returns true if the GEP is based on a pointer to a string (array of i8), 
+  /// and is indexing into this string.
+  bool isGEPBasedOnPointerToString(const GEPOperator *GEP);
+
   /// getConstantStringInfo - This function computes the length of a
   /// null-terminated C string pointed to by V.  If successful, it returns true
   /// and returns the string in Str.  If unsuccessful, it returns false.  This
@@ -227,25 +250,6 @@ namespace llvm {
   /// are lifetime markers.
   bool onlyUsedByLifetimeMarkers(const Value *V);
 
-  /// isDereferenceablePointer - Return true if this is always a dereferenceable
-  /// pointer. If the context instruction is specified perform context-sensitive
-  /// analysis and return true if the pointer is dereferenceable at the
-  /// specified instruction.
-  bool isDereferenceablePointer(const Value *V, const DataLayout &DL,
-                                const Instruction *CtxI = nullptr,
-                                const DominatorTree *DT = nullptr,
-                                const TargetLibraryInfo *TLI = nullptr);
-
-  /// Returns true if V is always a dereferenceable pointer with alignment
-  /// greater or equal than requested. If the context instruction is specified
-  /// performs context-sensitive analysis and returns true if the pointer is
-  /// dereferenceable at the specified instruction.
-  bool isDereferenceableAndAlignedPointer(const Value *V, unsigned Align,
-                                          const DataLayout &DL,
-                                          const Instruction *CtxI = nullptr,
-                                          const DominatorTree *DT = nullptr,
-                                          const TargetLibraryInfo *TLI = nullptr);
-  
   /// isSafeToSpeculativelyExecute - Return true if the instruction does not
   /// have any effects besides calculating the result and does not have
   /// undefined behavior.
@@ -277,7 +281,7 @@ namespace llvm {
 
   /// Returns true if the result or effects of the given instructions \p I
   /// depend on or influence global memory.
-  /// Memory dependence arises for example if the the instruction reads from
+  /// Memory dependence arises for example if the instruction reads from
   /// memory or may produce effects or undefined behaviour. Memory dependent
   /// instructions generally cannot be reorderd with respect to other memory
   /// dependent instructions or moved into non-dominated basic blocks.
@@ -403,6 +407,11 @@ namespace llvm {
     bool Ordered;               /// When implementing this min/max pattern as
                                 /// fcmp; select, does the fcmp have to be
                                 /// ordered?
+
+    /// \brief Return true if \p SPF is a min or a max pattern.
+    static bool isMinOrMax(SelectPatternFlavor SPF) {
+      return !(SPF == SPF_UNKNOWN || SPF == SPF_ABS || SPF == SPF_NABS);
+    }
   };
   /// Pattern match integer [SU]MIN, [SU]MAX and ABS idioms, returning the kind
   /// and providing the out parameter results if we successfully match.
@@ -422,6 +431,23 @@ namespace llvm {
   SelectPatternResult matchSelectPattern(Value *V, Value *&LHS, Value *&RHS,
                                          Instruction::CastOps *CastOp = nullptr);
 
+  /// Parse out a conservative ConstantRange from !range metadata.
+  ///
+  /// E.g. if RangeMD is !{i32 0, i32 10, i32 15, i32 20} then return [0, 20).
+  ConstantRange getConstantRangeFromMetadata(MDNode &RangeMD);
+
+  /// Return true if RHS is known to be implied by LHS.  A & B must be i1
+  /// (boolean) values or a vector of such values. Note that the truth table for
+  /// implication is the same as <=u on i1 values (but not <=s!).  The truth
+  /// table for both is:
+  ///    | T | F (B)
+  ///  T | T | F
+  ///  F | T | T
+  /// (A)
+  bool isImpliedCondition(Value *LHS, Value *RHS, const DataLayout &DL,
+                          unsigned Depth = 0, AssumptionCache *AC = nullptr,
+                          const Instruction *CxtI = nullptr,
+                          const DominatorTree *DT = nullptr);
 } // end namespace llvm
 
 #endif

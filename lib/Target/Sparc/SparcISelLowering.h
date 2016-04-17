@@ -89,6 +89,20 @@ namespace llvm {
       return MVT::i32;
     }
 
+    /// If a physical register, this returns the register that receives the
+    /// exception address on entry to an EH pad.
+    unsigned
+    getExceptionPointerRegister(const Constant *PersonalityFn) const override {
+      return SP::I0;
+    }
+
+    /// If a physical register, this returns the register that receives the
+    /// exception typeid on entry to a landing pad.
+    unsigned
+    getExceptionSelectorRegister(const Constant *PersonalityFn) const override {
+      return SP::I1;
+    }
+
     /// getSetCCResultType - Return the ISD::SETCC ValueType
     EVT getSetCCResultType(const DataLayout &DL, LLVMContext &Context,
                            EVT VT) const override;
@@ -165,6 +179,15 @@ namespace llvm {
       // (ldd, call _Q_fdtoq) is more expensive than two ldds.
       return VT != MVT::f128;
     }
+
+    bool shouldInsertFencesForAtomic(const Instruction *I) const override {
+      // FIXME: We insert fences for each atomics and generate
+      // sub-optimal code for PSO/TSO. (Approximately nobody uses any
+      // mode but TSO, which makes this even more silly)
+      return true;
+    }
+
+    AtomicExpansionKind shouldExpandAtomicRMWInIR(AtomicRMWInst *AI) const override;
 
     void ReplaceNodeResults(SDNode *N,
                             SmallVectorImpl<SDValue>& Results,

@@ -46,6 +46,7 @@ public:
   void printMachODysymtab() override;
   void printMachOSegment() override;
   void printMachOIndirectSymbols() override;
+  void printMachOLinkerOptions () override;
 
 private:
   template<class MachHeader>
@@ -238,7 +239,8 @@ static const EnumEntry<unsigned> MachOSymbolFlags[] = {
   { "ReferencedDynamically", 0x10 },
   { "NoDeadStrip",           0x20 },
   { "WeakRef",               0x40 },
-  { "WeakDef",               0x80 }
+  { "WeakDef",               0x80 },
+  { "AltEntry",             0x200 },
 };
 
 static const EnumEntry<unsigned> MachOSymbolTypes[] = {
@@ -266,8 +268,8 @@ namespace {
   };
 
   struct MachOSegment {
-    StringRef CmdName;
-    StringRef SegName;
+    std::string CmdName;
+    std::string SegName;
     uint64_t cmdsize;
     uint64_t vmaddr;
     uint64_t vmsize;
@@ -693,38 +695,46 @@ void MachODumper::printMachODataInCode() {
 
 void MachODumper::printMachOVersionMin() {
   for (const auto &Load : Obj->load_commands()) {
-    if (Load.C.cmd == MachO::LC_VERSION_MIN_MACOSX ||
-        Load.C.cmd == MachO::LC_VERSION_MIN_IPHONEOS) {
-      MachO::version_min_command VMC = Obj->getVersionMinLoadCommand(Load);
-      DictScope Group(W, "MinVersion");
-      StringRef Cmd;
-      if (Load.C.cmd == MachO::LC_VERSION_MIN_MACOSX)
-        Cmd = "LC_VERSION_MIN_MACOSX";
-      else
-        Cmd = "LC_VERSION_MIN_IPHONEOS";
-      W.printString("Cmd", Cmd);
-      W.printNumber("Size", VMC.cmdsize);
-      SmallString<32> Version;
-      Version = utostr(MachOObjectFile::getVersionMinMajor(VMC, false)) + "." +
-        utostr(MachOObjectFile::getVersionMinMinor(VMC, false));
-      uint32_t Update = MachOObjectFile::getVersionMinUpdate(VMC, false);
-      if (Update != 0)
-        Version += "." + utostr(MachOObjectFile::getVersionMinUpdate(VMC,
-                                                                     false));
-      W.printString("Version", Version);
-      SmallString<32> SDK;
-      if (VMC.sdk == 0)
-        SDK = "n/a";
-      else {
-        SDK = utostr(MachOObjectFile::getVersionMinMajor(VMC, true)) + "." +
-          utostr(MachOObjectFile::getVersionMinMinor(VMC, true));
-        uint32_t Update = MachOObjectFile::getVersionMinUpdate(VMC, true);
-        if (Update != 0)
-          SDK += "." + utostr(MachOObjectFile::getVersionMinUpdate(VMC,
-                                                                   true));
-      }
-      W.printString("SDK", SDK);
+    StringRef Cmd;
+    switch (Load.C.cmd) {
+    case MachO::LC_VERSION_MIN_MACOSX:
+      Cmd = "LC_VERSION_MIN_MACOSX";
+      break;
+    case MachO::LC_VERSION_MIN_IPHONEOS:
+      Cmd = "LC_VERSION_MIN_IPHONEOS";
+      break;
+    case MachO::LC_VERSION_MIN_TVOS:
+      Cmd = "LC_VERSION_MIN_TVOS";
+      break;
+    case MachO::LC_VERSION_MIN_WATCHOS:
+      Cmd = "LC_VERSION_MIN_WATCHOS";
+      break;
+    default:
+      continue;
     }
+
+    MachO::version_min_command VMC = Obj->getVersionMinLoadCommand(Load);
+    DictScope Group(W, "MinVersion");
+    W.printString("Cmd", Cmd);
+    W.printNumber("Size", VMC.cmdsize);
+    SmallString<32> Version;
+    Version = utostr(MachOObjectFile::getVersionMinMajor(VMC, false)) + "." +
+              utostr(MachOObjectFile::getVersionMinMinor(VMC, false));
+    uint32_t Update = MachOObjectFile::getVersionMinUpdate(VMC, false);
+    if (Update != 0)
+      Version += "." + utostr(MachOObjectFile::getVersionMinUpdate(VMC, false));
+    W.printString("Version", Version);
+    SmallString<32> SDK;
+    if (VMC.sdk == 0)
+      SDK = "n/a";
+    else {
+      SDK = utostr(MachOObjectFile::getVersionMinMajor(VMC, true)) + "." +
+            utostr(MachOObjectFile::getVersionMinMinor(VMC, true));
+      uint32_t Update = MachOObjectFile::getVersionMinUpdate(VMC, true);
+      if (Update != 0)
+        SDK += "." + utostr(MachOObjectFile::getVersionMinUpdate(VMC, true));
+    }
+    W.printString("SDK", SDK);
   }
 }
 
@@ -787,6 +797,25 @@ void MachODumper::printMachOIndirectSymbols() {
         DictScope Group(W, "Entry");
         W.printNumber("Entry Index", i);
         W.printHex("Symbol Index", Obj->getIndirectSymbolTableEntry(DLC, i));
+      }
+    }
+  }
+}
+
+void MachODumper::printMachOLinkerOptions() {
+  for (const auto &Load : Obj->load_commands()) {
+    if (Load.C.cmd == MachO::LC_LINKER_OPTION) {
+      MachO::linker_option_command LOLC = Obj->getLinkerOptionLoadCommand(Load);
+      DictScope Group(W, "Linker Options");
+      W.printNumber("Size", LOLC.cmdsize);
+      ListScope D(W, "Strings");
+      uint64_t DataSize = LOLC.cmdsize - sizeof(MachO::linker_option_command);
+      const char *P = Load.Ptr + sizeof(MachO::linker_option_command);
+      StringRef Data(P, DataSize);
+      for (unsigned i = 0; i < LOLC.count; ++i) {
+        std::pair<StringRef,StringRef> Split = Data.split('\0');
+        W.printString("Value", Split.first);
+        Data = Split.second;
       }
     }
   }

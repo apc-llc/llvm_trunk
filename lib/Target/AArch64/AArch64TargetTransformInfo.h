@@ -48,7 +48,7 @@ class AArch64TTIImpl : public BasicTTIImplBase<AArch64TTIImpl> {
   };
 
 public:
-  explicit AArch64TTIImpl(const AArch64TargetMachine *TM, Function &F)
+  explicit AArch64TTIImpl(const AArch64TargetMachine *TM, const Function &F)
       : BaseT(TM, F.getParent()->getDataLayout()), ST(TM->getSubtargetImpl(F)),
         TLI(ST->getTargetLowering()) {}
 
@@ -127,6 +127,14 @@ public:
   int getInterleavedMemoryOpCost(unsigned Opcode, Type *VecTy, unsigned Factor,
                                  ArrayRef<unsigned> Indices, unsigned Alignment,
                                  unsigned AddressSpace);
+
+  unsigned getCacheLineSize();
+
+  unsigned getPrefetchDistance();
+
+  unsigned getMinPrefetchStride();
+
+  unsigned getMaxPrefetchIterationsAhead();
   /// @}
 };
 

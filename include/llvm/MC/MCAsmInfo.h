@@ -280,6 +280,10 @@ protected:
   /// to false.
   bool HasNoDeadStrip;
 
+  /// True if this target supports the MachO .alt_entry directive.  Defaults to
+  /// false.
+  bool HasAltEntry;
+
   /// Used to declare a global as being a weak symbol. Defaults to ".weak".
   const char *WeakDirective;
 
@@ -414,6 +418,15 @@ public:
   /// syntactically correct.
   virtual bool isValidUnquotedName(StringRef Name) const;
 
+  /// Return true if the .section directive should be omitted when
+  /// emitting \p SectionName.  For example:
+  ///
+  /// shouldOmitSectionDirective(".text")
+  ///
+  /// returns false => .section .text,#alloc,#execinstr
+  /// returns true  => .text
+  virtual bool shouldOmitSectionDirective(StringRef SectionName) const;
+
   bool usesSunStyleELFSectionSwitchSyntax() const {
     return SunStyleELFSectionSwitchSyntax;
   }
@@ -489,6 +502,7 @@ public:
   bool hasSingleParameterDotFile() const { return HasSingleParameterDotFile; }
   bool hasIdentDirective() const { return HasIdentDirective; }
   bool hasNoDeadStrip() const { return HasNoDeadStrip; }
+  bool hasAltEntry() const { return HasAltEntry; }
   const char *getWeakDirective() const { return WeakDirective; }
   const char *getWeakRefDirective() const { return WeakRefDirective; }
   bool hasWeakDefDirective() const { return HasWeakDefDirective; }

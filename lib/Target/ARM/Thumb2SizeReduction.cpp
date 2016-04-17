@@ -125,7 +125,10 @@ namespace {
   { ARM::t2LDMIA, ARM::tLDMIA,  0,             0,   0,   1,   1,  1,1, 0,1,0 },
   { ARM::t2LDMIA_RET,0,         ARM::tPOP_RET, 0,   0,   1,   1,  1,1, 0,1,0 },
   { ARM::t2LDMIA_UPD,ARM::tLDMIA_UPD,ARM::tPOP,0,   0,   1,   1,  1,1, 0,1,0 },
-  // ARM::t2STM (with no basereg writeback) has no Thumb1 equivalent
+  // ARM::t2STMIA (with no basereg writeback) has no Thumb1 equivalent.
+  // tSTMIA_UPD is a change in semantics which can only be used if the base
+  // register is killed. This difference is correctly handled elsewhere.
+  { ARM::t2STMIA, ARM::tSTMIA_UPD, 0,          0,   0,   1,   1,  1,1, 0,1,0 },
   { ARM::t2STMIA_UPD,ARM::tSTMIA_UPD, 0,       0,   0,   1,   1,  1,1, 0,1,0 },
   { ARM::t2STMDB_UPD, 0,        ARM::tPUSH,    0,   0,   1,   1,  1,1, 0,1,0 }
   };
@@ -139,6 +142,11 @@ namespace {
     const ARMSubtarget *STI;
 
     bool runOnMachineFunction(MachineFunction &MF) override;
+
+    MachineFunctionProperties getRequiredProperties() const override {
+      return MachineFunctionProperties().set(
+          MachineFunctionProperties::Property::AllVRegsAllocated);
+    }
 
     const char *getPassName() const override {
       return "Thumb2 instruction size reduction pass";
@@ -210,12 +218,12 @@ Thumb2SizeReduce::Thumb2SizeReduce(std::function<bool(const Function &)> Ftor)
   for (unsigned i = 0, e = array_lengthof(ReduceTable); i != e; ++i) {
     unsigned FromOpc = ReduceTable[i].WideOpc;
     if (!ReduceOpcodeMap.insert(std::make_pair(FromOpc, i)).second)
-      assert(false && "Duplicated entries?");
+      llvm_unreachable("Duplicated entries?");
   }
 }
 
 static bool HasImplicitCPSRDef(const MCInstrDesc &MCID) {
-  for (const uint16_t *Regs = MCID.getImplicitDefs(); *Regs; ++Regs)
+  for (const MCPhysReg *Regs = MCID.getImplicitDefs(); *Regs; ++Regs)
     if (*Regs == ARM::CPSR)
       return true;
   return false;
@@ -435,6 +443,14 @@ Thumb2SizeReduce::ReduceLoadStore(MachineBasicBlock &MBB, MachineInstr *MI,
     isLdStMul = true;
     break;
   }
+  case ARM::t2STMIA: {
+    // If the base register is killed, we don't care what its value is after the
+    // instruction, so we can use an updating STMIA.
+    if (!MI->getOperand(0).isKill())
+      return false;
+
+    break;
+  }
   case ARM::t2LDMIA_RET: {
     unsigned BaseReg = MI->getOperand(1).getReg();
     if (BaseReg != ARM::SP)
@@ -492,6 +508,12 @@ Thumb2SizeReduce::ReduceLoadStore(MachineBasicBlock &MBB, MachineInstr *MI,
   // Add the 16-bit load / store instruction.
   DebugLoc dl = MI->getDebugLoc();
   MachineInstrBuilder MIB = BuildMI(MBB, MI, dl, TII->get(Opc));
+
+  // tSTMIA_UPD takes a defining register operand. We've already checked that
+  // the register is killed, so mark it as dead here.
+  if (Entry.WideOpc == ARM::t2STMIA)
+    MIB.addReg(MI->getOperand(0).getReg(), RegState::Define | RegState::Dead);
+
   if (!isLdStMul) {
     MIB.addOperand(MI->getOperand(0));
     MIB.addOperand(MI->getOperand(1));
@@ -580,7 +602,7 @@ Thumb2SizeReduce::ReduceSpecial(MachineBasicBlock &MBB, MachineInstr *MI,
   case ARM::t2ADDSri:
   case ARM::t2ADDSrr: {
     unsigned PredReg = 0;
-    if (getInstrPredicate(MI, PredReg) == ARMCC::AL) {
+    if (getInstrPredicate(*MI, PredReg) == ARMCC::AL) {
       switch (Opc) {
       default: break;
       case ARM::t2ADDSri: {
@@ -659,11 +681,13 @@ Thumb2SizeReduce::ReduceTo2Addr(MachineBasicBlock &MBB, MachineInstr *MI,
     }
   } else if (Reg0 != Reg1) {
     // Try to commute the operands to make it a 2-address instruction.
-    unsigned CommOpIdx1, CommOpIdx2;
+    unsigned CommOpIdx1 = 1;
+    unsigned CommOpIdx2 = TargetInstrInfo::CommuteAnyOperandIndex;
     if (!TII->findCommutedOpIndices(MI, CommOpIdx1, CommOpIdx2) ||
-        CommOpIdx1 != 1 || MI->getOperand(CommOpIdx2).getReg() != Reg0)
+        MI->getOperand(CommOpIdx2).getReg() != Reg0)
       return false;
-    MachineInstr *CommutedMI = TII->commuteInstruction(MI);
+    MachineInstr *CommutedMI =
+        TII->commuteInstruction(MI, false, CommOpIdx1, CommOpIdx2);
     if (!CommutedMI)
       return false;
   }
@@ -683,7 +707,7 @@ Thumb2SizeReduce::ReduceTo2Addr(MachineBasicBlock &MBB, MachineInstr *MI,
   // Check if it's possible / necessary to transfer the predicate.
   const MCInstrDesc &NewMCID = TII->get(Entry.NarrowOpc2);
   unsigned PredReg = 0;
-  ARMCC::CondCodes Pred = getInstrPredicate(MI, PredReg);
+  ARMCC::CondCodes Pred = getInstrPredicate(*MI, PredReg);
   bool SkipPred = false;
   if (Pred != ARMCC::AL) {
     if (!NewMCID.isPredicable())
@@ -779,7 +803,7 @@ Thumb2SizeReduce::ReduceToNarrow(MachineBasicBlock &MBB, MachineInstr *MI,
   // Check if it's possible / necessary to transfer the predicate.
   const MCInstrDesc &NewMCID = TII->get(Entry.NarrowOpc1);
   unsigned PredReg = 0;
-  ARMCC::CondCodes Pred = getInstrPredicate(MI, PredReg);
+  ARMCC::CondCodes Pred = getInstrPredicate(*MI, PredReg);
   bool SkipPred = false;
   if (Pred != ARMCC::AL) {
     if (!NewMCID.isPredicable())

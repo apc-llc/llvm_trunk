@@ -10,17 +10,17 @@
 #ifndef LLVM_LIB_TARGET_ARM_ARMASMBACKENDDARWIN_H
 #define LLVM_LIB_TARGET_ARM_ARMASMBACKENDDARWIN_H
 
+#include "ARMAsmBackend.h"
 #include "llvm/Support/MachO.h"
 
-using namespace llvm;
-
-namespace {
+namespace llvm {
 class ARMAsmBackendDarwin : public ARMAsmBackend {
+  const MCRegisterInfo &MRI;
 public:
   const MachO::CPUSubTypeARM Subtype;
   ARMAsmBackendDarwin(const Target &T, const Triple &TT,
-                      MachO::CPUSubTypeARM st)
-      : ARMAsmBackend(T, TT, /* IsLittleEndian */ true), Subtype(st) {
+                      const MCRegisterInfo &MRI, MachO::CPUSubTypeARM st)
+      : ARMAsmBackend(T, TT, /* IsLittleEndian */ true), MRI(MRI), Subtype(st) {
     HasDataInCodeSupport = true;
   }
 
@@ -28,7 +28,10 @@ public:
     return createARMMachObjectWriter(OS, /*Is64Bit=*/false, MachO::CPU_TYPE_ARM,
                                      Subtype);
   }
+
+  uint32_t generateCompactUnwindEncoding(
+      ArrayRef<MCCFIInstruction> Instrs) const override;
 };
-}
+} // end namespace llvm
 
 #endif

@@ -51,7 +51,6 @@ def : RsqPat<RECIPSQRT_IEEE_cm, f32>;
 def : POW_Common <LOG_IEEE_cm, EXP_IEEE_cm, MUL>;
 
 defm DIV_cm : DIV_Common<RECIP_IEEE_cm>;
-defm : Expand24UBitOps<MULLO_UINT_cm, ADD_INT>;
 
 // RECIP_UINT emulation for Cayman
 // The multiplication scales from [0,1] to the unsigned integer range
@@ -81,6 +80,10 @@ class RAT_STORE_DWORD <RegisterClass rc, ValueType vt, bits<4> mask> :
 def RAT_STORE_DWORD32 : RAT_STORE_DWORD <R600_TReg32_X, i32, 0x1>;
 def RAT_STORE_DWORD64 : RAT_STORE_DWORD <R600_Reg64, v2i32, 0x3>;
 def RAT_STORE_DWORD128 : RAT_STORE_DWORD <R600_Reg128, v4i32, 0xf>;
+
+def RAT_STORE_TYPED_cm: CF_MEM_RAT_STORE_TYPED<0> {
+  let eop = 0; // This bit is not used on Cayman.
+}
 
 class VTX_READ_cm <string name, bits<8> buffer_id, dag outs, list<dag> pattern>
     : VTX_WORD0_cm, VTX_READ<name, buffer_id, outs, pattern> {

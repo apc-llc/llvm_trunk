@@ -55,6 +55,11 @@ namespace {
 
     bool runOnMachineFunction(MachineFunction &MF) override;
 
+    MachineFunctionProperties getRequiredProperties() const override {
+      return MachineFunctionProperties().set(
+          MachineFunctionProperties::Property::AllVRegsAllocated);
+    }
+
     const char *getPassName() const override {
       return "X86 Atom pad short functions";
     }
@@ -106,7 +111,7 @@ bool PadShortFunc::runOnMachineFunction(MachineFunction &MF) {
   // Search through basic blocks and mark the ones that have early returns
   ReturnBBs.clear();
   VisitedBBs.clear();
-  findReturns(MF.begin());
+  findReturns(&MF.front());
 
   bool MadeChange = false;
 

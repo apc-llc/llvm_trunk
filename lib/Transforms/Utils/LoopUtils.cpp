@@ -11,14 +11,20 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "llvm/Analysis/AliasAnalysis.h"
+#include "llvm/Analysis/BasicAliasAnalysis.h"
 #include "llvm/Analysis/LoopInfo.h"
-#include "llvm/IR/Instructions.h"
-#include "llvm/IR/PatternMatch.h"
-#include "llvm/IR/ValueHandle.h"
-#include "llvm/Support/Debug.h"
+#include "llvm/Analysis/GlobalsModRef.h"
 #include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/Analysis/ScalarEvolutionExpressions.h"
+#include "llvm/Analysis/ScalarEvolutionAliasAnalysis.h"
+#include "llvm/IR/Dominators.h"
+#include "llvm/IR/Instructions.h"
 #include "llvm/IR/Module.h"
+#include "llvm/IR/PatternMatch.h"
+#include "llvm/IR/ValueHandle.h"
+#include "llvm/Pass.h"
+#include "llvm/Support/Debug.h"
 #include "llvm/Transforms/Utils/LoopUtils.h"
 
 using namespace llvm;
@@ -98,6 +104,7 @@ bool RecurrenceDescriptor::getSourceExtensionKind(
 
   SmallVector<Instruction *, 8> Worklist;
   bool FoundOneOperand = false;
+  unsigned DstSize = RT->getPrimitiveSizeInBits();
   Worklist.push_back(Exit);
 
   // Traverse the instructions in the reduction expression, beginning with the
@@ -120,11 +127,16 @@ bool RecurrenceDescriptor::getSourceExtensionKind(
 
       // If the operand is not in Visited, it is not a reduction operation, but
       // it does feed into one. Make sure it is either a single-use sign- or
-      // zero-extend of the recurrence type.
+      // zero-extend instruction.
       CastInst *Cast = dyn_cast<CastInst>(J);
       bool IsSExtInst = isa<SExtInst>(J);
-      if (!Cast || !Cast->hasOneUse() || Cast->getSrcTy() != RT ||
-          !(isa<ZExtInst>(J) || IsSExtInst))
+      if (!Cast || !Cast->hasOneUse() || !(isa<ZExtInst>(J) || IsSExtInst))
+        return false;
+
+      // Ensure the source type of the extend is no larger than the reduction
+      // type. It is not necessary for the types to be identical.
+      unsigned SrcSize = Cast->getSrcTy()->getPrimitiveSizeInBits();
+      if (SrcSize > DstSize)
         return false;
 
       // Furthermore, ensure that all such extends are of the same kind.
@@ -136,9 +148,11 @@ bool RecurrenceDescriptor::getSourceExtensionKind(
         IsSigned = IsSExtInst;
       }
 
-      // Lastly, add the sign- or zero-extend to CI so that we can avoid
-      // accounting for it in the cost model.
-      CI.insert(Cast);
+      // Lastly, if the source type of the extend matches the reduction type,
+      // add the extend to CI so that we can avoid accounting for it in the
+      // cost model.
+      if (SrcSize == DstSize)
+        CI.insert(Cast);
     }
   }
   return true;
@@ -458,12 +472,10 @@ bool RecurrenceDescriptor::hasMultipleUsesOf(
 bool RecurrenceDescriptor::isReductionPHI(PHINode *Phi, Loop *TheLoop,
                                           RecurrenceDescriptor &RedDes) {
 
-  bool HasFunNoNaNAttr = false;
   BasicBlock *Header = TheLoop->getHeader();
   Function &F = *Header->getParent();
-  if (F.hasFnAttribute("no-nans-fp-math"))
-    HasFunNoNaNAttr =
-        F.getFnAttribute("no-nans-fp-math").getValueAsString() == "true";
+  bool HasFunNoNaNAttr =
+      F.getFnAttribute("no-nans-fp-math").getValueAsString() == "true";
 
   if (AddReductionVar(Phi, RK_IntegerAdd, TheLoop, HasFunNoNaNAttr, RedDes)) {
     DEBUG(dbgs() << "Found an ADD reduction PHI." << *Phi << "\n");
@@ -504,6 +516,43 @@ bool RecurrenceDescriptor::isReductionPHI(PHINode *Phi, Loop *TheLoop,
   }
   // Not a reduction of known type.
   return false;
+}
+
+bool RecurrenceDescriptor::isFirstOrderRecurrence(PHINode *Phi, Loop *TheLoop,
+                                                  DominatorTree *DT) {
+
+  // Ensure the phi node is in the loop header and has two incoming values.
+  if (Phi->getParent() != TheLoop->getHeader() ||
+      Phi->getNumIncomingValues() != 2)
+    return false;
+
+  // Ensure the loop has a preheader and a single latch block. The loop
+  // vectorizer will need the latch to set up the next iteration of the loop.
+  auto *Preheader = TheLoop->getLoopPreheader();
+  auto *Latch = TheLoop->getLoopLatch();
+  if (!Preheader || !Latch)
+    return false;
+
+  // Ensure the phi node's incoming blocks are the loop preheader and latch.
+  if (Phi->getBasicBlockIndex(Preheader) < 0 ||
+      Phi->getBasicBlockIndex(Latch) < 0)
+    return false;
+
+  // Get the previous value. The previous value comes from the latch edge while
+  // the initial value comes form the preheader edge.
+  auto *Previous = dyn_cast<Instruction>(Phi->getIncomingValueForBlock(Latch));
+  if (!Previous || !TheLoop->contains(Previous) || isa<PHINode>(Previous))
+    return false;
+
+  // Ensure every user of the phi node is dominated by the previous value. The
+  // dominance requirement ensures the loop vectorizer will not need to
+  // vectorize the initial value prior to the first iteration of the loop.
+  for (User *U : Phi->users())
+    if (auto *I = dyn_cast<Instruction>(U))
+      if (!DT->dominates(Previous, I))
+        return false;
+
+  return true;
 }
 
 /// This function returns the identity element (or neutral element) for
@@ -585,6 +634,13 @@ Value *RecurrenceDescriptor::createMinMaxOp(IRBuilder<> &Builder,
     P = CmpInst::FCMP_OGT;
     break;
   }
+
+  // We only match FP sequences with unsafe algebra, so we can unconditionally
+  // set it on any generated instructions.
+  IRBuilder<>::FastMathFlagGuard FMFG(Builder);
+  FastMathFlags FMF;
+  FMF.setUnsafeAlgebra();
+  Builder.setFastMathFlags(FMF);
 
   Value *Cmp;
   if (RK == MRK_FloatMin || RK == MRK_FloatMax)
@@ -711,4 +767,58 @@ SmallVector<Instruction *, 8> llvm::findDefsUsedOutsideOfLoop(Loop *L) {
     }
 
   return UsedOutside;
+}
+
+void llvm::getLoopAnalysisUsage(AnalysisUsage &AU) {
+  // By definition, all loop passes need the LoopInfo analysis and the
+  // Dominator tree it depends on. Because they all participate in the loop
+  // pass manager, they must also preserve these.
+  AU.addRequired<DominatorTreeWrapperPass>();
+  AU.addPreserved<DominatorTreeWrapperPass>();
+  AU.addRequired<LoopInfoWrapperPass>();
+  AU.addPreserved<LoopInfoWrapperPass>();
+
+  // We must also preserve LoopSimplify and LCSSA. We locally access their IDs
+  // here because users shouldn't directly get them from this header.
+  extern char &LoopSimplifyID;
+  extern char &LCSSAID;
+  AU.addRequiredID(LoopSimplifyID);
+  AU.addPreservedID(LoopSimplifyID);
+  AU.addRequiredID(LCSSAID);
+  AU.addPreservedID(LCSSAID);
+
+  // Loop passes are designed to run inside of a loop pass manager which means
+  // that any function analyses they require must be required by the first loop
+  // pass in the manager (so that it is computed before the loop pass manager
+  // runs) and preserved by all loop pasess in the manager. To make this
+  // reasonably robust, the set needed for most loop passes is maintained here.
+  // If your loop pass requires an analysis not listed here, you will need to
+  // carefully audit the loop pass manager nesting structure that results.
+  AU.addRequired<AAResultsWrapperPass>();
+  AU.addPreserved<AAResultsWrapperPass>();
+  AU.addPreserved<BasicAAWrapperPass>();
+  AU.addPreserved<GlobalsAAWrapperPass>();
+  AU.addPreserved<SCEVAAWrapperPass>();
+  AU.addRequired<ScalarEvolutionWrapperPass>();
+  AU.addPreserved<ScalarEvolutionWrapperPass>();
+}
+
+/// Manually defined generic "LoopPass" dependency initialization. This is used
+/// to initialize the exact set of passes from above in \c
+/// getLoopAnalysisUsage. It can be used within a loop pass's initialization
+/// with:
+///
+///   INITIALIZE_PASS_DEPENDENCY(LoopPass)
+///
+/// As-if "LoopPass" were a pass.
+void llvm::initializeLoopPassPass(PassRegistry &Registry) {
+  INITIALIZE_PASS_DEPENDENCY(DominatorTreeWrapperPass)
+  INITIALIZE_PASS_DEPENDENCY(LoopInfoWrapperPass)
+  INITIALIZE_PASS_DEPENDENCY(LoopSimplify)
+  INITIALIZE_PASS_DEPENDENCY(LCSSA)
+  INITIALIZE_PASS_DEPENDENCY(AAResultsWrapperPass)
+  INITIALIZE_PASS_DEPENDENCY(BasicAAWrapperPass)
+  INITIALIZE_PASS_DEPENDENCY(GlobalsAAWrapperPass)
+  INITIALIZE_PASS_DEPENDENCY(SCEVAAWrapperPass)
+  INITIALIZE_PASS_DEPENDENCY(ScalarEvolutionWrapperPass)
 }

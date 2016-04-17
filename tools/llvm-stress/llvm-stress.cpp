@@ -43,6 +43,8 @@ static cl::opt<std::string>
 OutputFilename("o", cl::desc("Override output filename"),
                cl::value_desc("filename"));
 
+static LLVMContext Context;
+
 namespace cl {
 template <> class parser<Type*> final : public basic_parser<Type*> {
 public:
@@ -50,7 +52,6 @@ public:
 
   // Parse options as IR types. Return true on error.
   bool parse(Option &O, StringRef, StringRef Arg, Type *&Value) {
-    auto &Context = getGlobalContext();
     if      (Arg == "half")      Value = Type::getHalfTy(Context);
     else if (Arg == "fp128")     Value = Type::getFP128Ty(Context);
     else if (Arg == "x86_fp80")  Value = Type::getX86_FP80Ty(Context);
@@ -612,7 +613,8 @@ struct CmpModifier: public Modifier {
     }
 
     Value *V = CmpInst::Create(fp ? Instruction::FCmp : Instruction::ICmp,
-                               op, Val0, Val1, "Cmp", BB->getTerminator());
+                               (CmpInst::Predicate)op, Val0, Val1, "Cmp",
+                               BB->getTerminator());
     return PT->push_back(V);
   }
 };
@@ -666,7 +668,7 @@ static void IntroduceControlFlow(Function *F, Random &R) {
 
   for (auto *Instr : BoolInst) {
     BasicBlock *Curr = Instr->getParent();
-    BasicBlock::iterator Loc = Instr;
+    BasicBlock::iterator Loc = Instr->getIterator();
     BasicBlock *Next = Curr->splitBasicBlock(Loc, "CF");
     Instr->moveBefore(Curr->getTerminator());
     if (Curr != &F->getEntryBlock()) {
@@ -686,7 +688,7 @@ int main(int argc, char **argv) {
   cl::ParseCommandLineOptions(argc, argv, "llvm codegen stress-tester\n");
   llvm_shutdown_obj Y;
 
-  auto M = make_unique<Module>("/tmp/autogen.bc", getGlobalContext());
+  auto M = make_unique<Module>("/tmp/autogen.bc", Context);
   Function *F = GenEmptyFunction(M.get());
 
   // Pick an initial seed value

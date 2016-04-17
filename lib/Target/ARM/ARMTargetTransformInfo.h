@@ -41,7 +41,7 @@ class ARMTTIImpl : public BasicTTIImplBase<ARMTTIImpl> {
   const ARMTargetLowering *getTLI() const { return TLI; }
 
 public:
-  explicit ARMTTIImpl(const ARMBaseTargetMachine *TM, Function &F)
+  explicit ARMTTIImpl(const ARMBaseTargetMachine *TM, const Function &F)
       : BaseT(TM, F.getParent()->getDataLayout()), ST(TM->getSubtargetImpl(F)),
         TLI(ST->getTargetLowering()) {}
 
@@ -54,11 +54,17 @@ public:
 
   bool enableInterleavedAccessVectorization() { return true; }
 
+  bool isFPVectorizationPotentiallyUnsafe() {
+    return !ST->hasFPARMv8() && !ST->isTargetDarwin();
+  }
+
   /// \name Scalar TTI Implementations
   /// @{
 
   using BaseT::getIntImmCost;
   int getIntImmCost(const APInt &Imm, Type *Ty);
+
+  int getIntImmCost(unsigned Opcode, unsigned Idx, const APInt &Imm, Type *Ty);
 
   /// @}
 

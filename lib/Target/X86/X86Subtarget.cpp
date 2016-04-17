@@ -83,7 +83,7 @@ ClassifyGlobalReference(const GlobalValue *GV, const TargetMachine &TM) const {
     } else if (!isTargetWin64()) {
       assert(isTargetELF() && "Unknown rip-relative target");
 
-      // Extra load is needed for all externally visible.
+      // Extra load is needed for all externally visible globals.
       if (!GV->hasLocalLinkage() && GV->hasDefaultVisibility())
         return X86II::MO_GOTPCREL;
     }
@@ -189,6 +189,15 @@ void X86Subtarget::initSubtargetFeatures(StringRef CPU, StringRef FS) {
       FullFS = "+64bit,+sse2";
   }
 
+  // LAHF/SAHF are always supported in non-64-bit mode.
+  if (!In64BitMode) {
+    if (!FullFS.empty())
+      FullFS = "+sahf," + FullFS;
+    else
+      FullFS = "+sahf";
+  }
+
+
   // Parse features string and set the CPU.
   ParseSubtargetFeatures(CPUName, FullFS);
 
@@ -228,13 +237,19 @@ void X86Subtarget::initSubtargetFeatures(StringRef CPU, StringRef FS) {
 }
 
 void X86Subtarget::initializeEnvironment() {
-  X86SSELevel = NoMMXSSE;
+  X86SSELevel = NoSSE;
   X863DNowLevel = NoThreeDNow;
+  HasX87 = false;
   HasCMov = false;
   HasX86_64 = false;
   HasPOPCNT = false;
   HasSSE4A = false;
   HasAES = false;
+  HasFXSR = false;
+  HasXSAVE = false;
+  HasXSAVEOPT = false;
+  HasXSAVEC = false;
+  HasXSAVES = false;
   HasPCLMUL = false;
   HasFMA = false;
   HasFMA4 = false;
@@ -247,6 +262,8 @@ void X86Subtarget::initializeEnvironment() {
   HasLZCNT = false;
   HasBMI = false;
   HasBMI2 = false;
+  HasVBMI = false;
+  HasIFMA = false;
   HasRTM = false;
   HasHLE = false;
   HasERI = false;
@@ -256,9 +273,11 @@ void X86Subtarget::initializeEnvironment() {
   HasBWI = false;
   HasVLX = false;
   HasADX = false;
+  HasPKU = false;
   HasSHA = false;
   HasPRFCHW = false;
   HasRDSEED = false;
+  HasLAHFSAHF = false;
   HasMPX = false;
   IsBTMemSlow = false;
   IsSHLDSlow = false;
@@ -267,6 +286,7 @@ void X86Subtarget::initializeEnvironment() {
   HasSSEUnalignedMem = false;
   HasCmpxchg16b = false;
   UseLeaForSP = false;
+  HasFastPartialYMMWrite = false;
   HasSlowDivide32 = false;
   HasSlowDivide64 = false;
   PadShortFunctions = false;

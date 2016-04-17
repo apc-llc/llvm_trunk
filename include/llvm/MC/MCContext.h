@@ -16,7 +16,9 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/Twine.h"
+#include "llvm/MC/MCCodeView.h"
 #include "llvm/MC/MCDwarf.h"
+#include "llvm/MC/MCSubtargetInfo.h"
 #include "llvm/MC/SectionKind.h"
 #include "llvm/Support/Allocator.h"
 #include "llvm/Support/Compiler.h"
@@ -41,6 +43,7 @@ namespace llvm {
   class MCSectionMachO;
   class MCSectionELF;
   class MCSectionCOFF;
+  class CodeViewContext;
 
   /// Context object for machine code objects.  This class owns all of the
   /// sections that it creates.
@@ -65,11 +68,17 @@ namespace llvm {
     /// The MCObjectFileInfo for this target.
     const MCObjectFileInfo *MOFI;
 
+    std::unique_ptr<CodeViewContext> CVContext;
+
     /// Allocator object used for creating machine code objects.
     ///
     /// We use a bump pointer allocator to avoid the need to track all allocated
     /// objects.
     BumpPtrAllocator Allocator;
+
+    SpecificBumpPtrAllocator<MCSectionCOFF> COFFAllocator;
+    SpecificBumpPtrAllocator<MCSectionELF> ELFAllocator;
+    SpecificBumpPtrAllocator<MCSectionMachO> MachOAllocator;
 
     /// Bindings of names to symbols.
     SymbolTable Symbols;
@@ -87,7 +96,9 @@ namespace llvm {
     DenseMap<std::pair<unsigned, unsigned>, MCSymbol *> LocalSymbols;
 
     /// Keeps tracks of names that were used both for used declared and
-    /// artificial symbols.
+    /// artificial symbols. The value is "true" if the name has been used for a
+    /// non-section symbol (there can be at most one of those, plus an unlimited
+    /// number of section symbols with the same name).
     StringMap<bool, BumpPtrAllocator &> UsedNames;
 
     /// The next ID to dole out to an unnamed assembler temporary symbol with
@@ -108,7 +119,7 @@ namespace llvm {
     /// directive is used or it is an error.
     char *SecureLogFile;
     /// The stream that gets written to for the .secure_log_unique directive.
-    raw_ostream *SecureLog;
+    std::unique_ptr<raw_fd_ostream> SecureLog;
     /// Boolean toggled when .secure_log_unique / .secure_log_reset is seen to
     /// catch errors if .secure_log_unique appears twice without
     /// .secure_log_reset appearing between them.
@@ -129,6 +140,10 @@ namespace llvm {
     /// The current dwarf line information from the last dwarf .loc directive.
     MCDwarfLoc CurrentDwarfLoc;
     bool DwarfLocSeen;
+
+    /// The current CodeView line information from the last .cv_loc directive.
+    MCCVLoc CurrentCVLoc = MCCVLoc(0, 0, 0, 0, false, true);
+    bool CVLocSeen = false;
 
     /// Generate dwarf debugging info for assembly source files.
     bool GenDwarfForAssembly;
@@ -203,8 +218,12 @@ namespace llvm {
     std::map<COFFSectionKey, MCSectionCOFF *> COFFUniquingMap;
     StringMap<bool> ELFRelSecNames;
 
+    SpecificBumpPtrAllocator<MCSubtargetInfo> MCSubtargetAllocator;
+
     /// Do automatic reset in destructor
     bool AutoReset;
+
+    bool HadError;
 
     MCSymbol *createSymbolImpl(const StringMapEntry<bool> *Name,
                                bool CanBeUnnamed);
@@ -227,6 +246,8 @@ namespace llvm {
     const MCRegisterInfo *getRegisterInfo() const { return MRI; }
 
     const MCObjectFileInfo *getObjectFileInfo() const { return MOFI; }
+
+    CodeViewContext &getCVContext();
 
     void setAllowTemporaryLabels(bool Value) { AllowTemporaryLabels = Value; }
     void setUseNamesOnTempLabels(bool Value) { UseNamesOnTempLabels = Value; }
@@ -376,20 +397,20 @@ namespace llvm {
     MCSectionCOFF *getAssociativeCOFFSection(MCSectionCOFF *Sec,
                                              const MCSymbol *KeySym);
 
+    // Create and save a copy of STI and return a reference to the copy.
+    MCSubtargetInfo &getSubtargetCopy(const MCSubtargetInfo &STI);
+
     /// @}
 
     /// \name Dwarf Management
     /// @{
 
     /// \brief Get the compilation directory for DW_AT_comp_dir
-    /// This can be overridden by clients which want to control the reported
-    /// compilation directory and have it be something other than the current
-    /// working directory.
-    /// Returns an empty string if the current directory cannot be determined.
+    /// The compilation directory should be set with \c setCompilationDir before
+    /// calling this function. If it is unset, an empty string will be returned.
     StringRef getCompilationDir() const { return CompilationDir; }
 
     /// \brief Set the compilation directory for DW_AT_comp_dir
-    /// Override the default (CWD) compilation directory.
     void setCompilationDir(StringRef S) { CompilationDir = S.str(); }
 
     /// \brief Get the main file name for use in error messages and debug
@@ -493,10 +514,41 @@ namespace llvm {
 
     /// @}
 
+
+    /// \name CodeView Management
+    /// @{
+
+    /// Creates an entry in the cv file table.
+    unsigned getCVFile(StringRef FileName, unsigned FileNumber);
+
+    /// Saves the information from the currently parsed .cv_loc directive
+    /// and sets CVLocSeen.  When the next instruction is assembled an entry
+    /// in the line number table with this information and the address of the
+    /// instruction will be created.
+    void setCurrentCVLoc(unsigned FunctionId, unsigned FileNo, unsigned Line,
+                         unsigned Column, bool PrologueEnd, bool IsStmt) {
+      CurrentCVLoc.setFunctionId(FunctionId);
+      CurrentCVLoc.setFileNum(FileNo);
+      CurrentCVLoc.setLine(Line);
+      CurrentCVLoc.setColumn(Column);
+      CurrentCVLoc.setPrologueEnd(PrologueEnd);
+      CurrentCVLoc.setIsStmt(IsStmt);
+      CVLocSeen = true;
+    }
+    void clearCVLocSeen() { CVLocSeen = false; }
+
+    bool getCVLocSeen() { return CVLocSeen; }
+    const MCCVLoc &getCurrentCVLoc() { return CurrentCVLoc; }
+
+    bool isValidCVFileNumber(unsigned FileNumber);
+    /// @}
+
     char *getSecureLogFile() { return SecureLogFile; }
-    raw_ostream *getSecureLog() { return SecureLog; }
+    raw_fd_ostream *getSecureLog() { return SecureLog.get(); }
     bool getSecureLogUsed() { return SecureLogUsed; }
-    void setSecureLog(raw_ostream *Value) { SecureLog = Value; }
+    void setSecureLog(std::unique_ptr<raw_fd_ostream> Value) {
+      SecureLog = std::move(Value);
+    }
     void setSecureLogUsed(bool Value) { SecureLogUsed = Value; }
 
     void *allocate(unsigned Size, unsigned Align = 8) {
@@ -504,11 +556,13 @@ namespace llvm {
     }
     void deallocate(void *Ptr) {}
 
+    bool hadError() { return HadError; }
+    void reportError(SMLoc L, const Twine &Msg);
     // Unrecoverable error has occurred. Display the best diagnostic we can
     // and bail via exit(1). For now, most MC backend errors are unrecoverable.
     // FIXME: We should really do something about that.
     LLVM_ATTRIBUTE_NORETURN void reportFatalError(SMLoc L,
-                                                  const Twine &Msg) const;
+                                                  const Twine &Msg);
   };
 
 } // end namespace llvm

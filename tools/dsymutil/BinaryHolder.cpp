@@ -109,7 +109,10 @@ BinaryHolder::GetArchiveMemberBuffers(StringRef Filename,
   Buffers.reserve(CurrentArchives.size());
 
   for (const auto &CurrentArchive : CurrentArchives) {
-    for (const auto &Child : CurrentArchive->children()) {
+    for (auto ChildOrErr : CurrentArchive->children()) {
+      if (std::error_code Err = ChildOrErr.getError())
+        return Err;
+      const auto &Child = *ChildOrErr;
       if (auto NameOrErr = Child.getName()) {
         if (*NameOrErr == Filename) {
           if (Timestamp != sys::TimeValue::PosixZeroTime() &&
@@ -193,8 +196,8 @@ BinaryHolder::GetObjectFiles(StringRef Filename, sys::TimeValue Timestamp) {
   CurrentObjectFiles.clear();
   for (auto MemBuf : *ErrOrMemBufferRefs) {
     auto ErrOrObjectFile = object::ObjectFile::createObjectFile(MemBuf);
-    if (auto Err = ErrOrObjectFile.getError())
-      return Err;
+    if (!ErrOrObjectFile)
+      return errorToErrorCode(ErrOrObjectFile.takeError());
 
     Objects.push_back(ErrOrObjectFile->get());
     CurrentObjectFiles.push_back(std::move(*ErrOrObjectFile));

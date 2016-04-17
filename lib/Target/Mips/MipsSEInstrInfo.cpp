@@ -12,6 +12,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "MipsSEInstrInfo.h"
+#include "MipsAnalyzeImmediate.h"
 #include "InstPrinter/MipsInstPrinter.h"
 #include "MipsMachineFunction.h"
 #include "MipsTargetMachine.h"
@@ -212,6 +213,33 @@ storeRegToStack(MachineBasicBlock &MBB, MachineBasicBlock::iterator I,
     Opc = Mips::ST_W;
   else if (RC->hasType(MVT::v2i64) || RC->hasType(MVT::v2f64))
     Opc = Mips::ST_D;
+  else if (Mips::LO32RegClass.hasSubClassEq(RC))
+    Opc = Mips::SW;
+  else if (Mips::LO64RegClass.hasSubClassEq(RC))
+    Opc = Mips::SD;
+  else if (Mips::HI32RegClass.hasSubClassEq(RC))
+    Opc = Mips::SW;
+  else if (Mips::HI64RegClass.hasSubClassEq(RC))
+    Opc = Mips::SD;
+
+  // Hi, Lo are normally caller save but they are callee save
+  // for interrupt handling.
+  const Function *Func = MBB.getParent()->getFunction();
+  if (Func->hasFnAttribute("interrupt")) {
+    if (Mips::HI32RegClass.hasSubClassEq(RC)) {
+      BuildMI(MBB, I, DL, get(Mips::MFHI), Mips::K0);
+      SrcReg = Mips::K0;
+    } else if (Mips::HI64RegClass.hasSubClassEq(RC)) {
+      BuildMI(MBB, I, DL, get(Mips::MFHI64), Mips::K0_64);
+      SrcReg = Mips::K0_64;
+    } else if (Mips::LO32RegClass.hasSubClassEq(RC)) {
+      BuildMI(MBB, I, DL, get(Mips::MFLO), Mips::K0);
+      SrcReg = Mips::K0;
+    } else if (Mips::LO64RegClass.hasSubClassEq(RC)) {
+      BuildMI(MBB, I, DL, get(Mips::MFLO64), Mips::K0_64);
+      SrcReg = Mips::K0_64;
+    }
+  }
 
   assert(Opc && "Register class not handled!");
   BuildMI(MBB, I, DL, get(Opc)).addReg(SrcReg, getKillRegState(isKill))
@@ -226,6 +254,11 @@ loadRegFromStack(MachineBasicBlock &MBB, MachineBasicBlock::iterator I,
   if (I != MBB.end()) DL = I->getDebugLoc();
   MachineMemOperand *MMO = GetMemOperand(MBB, FI, MachineMemOperand::MOLoad);
   unsigned Opc = 0;
+
+  const Function *Func = MBB.getParent()->getFunction();
+  bool ReqIndirectLoad = Func->hasFnAttribute("interrupt") &&
+                         (DestReg == Mips::LO0 || DestReg == Mips::LO0_64 ||
+                          DestReg == Mips::HI0 || DestReg == Mips::HI0_64);
 
   if (Mips::GPR32RegClass.hasSubClassEq(RC))
     Opc = Mips::LW;
@@ -253,10 +286,44 @@ loadRegFromStack(MachineBasicBlock &MBB, MachineBasicBlock::iterator I,
     Opc = Mips::LD_W;
   else if (RC->hasType(MVT::v2i64) || RC->hasType(MVT::v2f64))
     Opc = Mips::LD_D;
+  else if (Mips::HI32RegClass.hasSubClassEq(RC))
+    Opc = Mips::LW;
+  else if (Mips::HI64RegClass.hasSubClassEq(RC))
+    Opc = Mips::LD;
+  else if (Mips::LO32RegClass.hasSubClassEq(RC))
+    Opc = Mips::LW;
+  else if (Mips::LO64RegClass.hasSubClassEq(RC))
+    Opc = Mips::LD;
 
   assert(Opc && "Register class not handled!");
-  BuildMI(MBB, I, DL, get(Opc), DestReg).addFrameIndex(FI).addImm(Offset)
-    .addMemOperand(MMO);
+
+  if (!ReqIndirectLoad)
+    BuildMI(MBB, I, DL, get(Opc), DestReg)
+        .addFrameIndex(FI)
+        .addImm(Offset)
+        .addMemOperand(MMO);
+  else {
+    // Load HI/LO through K0. Notably the DestReg is encoded into the
+    // instruction itself.
+    unsigned Reg = Mips::K0;
+    unsigned LdOp = Mips::MTLO;
+    if (DestReg == Mips::HI0)
+      LdOp = Mips::MTHI;
+
+    if (Subtarget.getABI().ArePtrs64bit()) {
+      Reg = Mips::K0_64;
+      if (DestReg == Mips::HI0_64)
+        LdOp = Mips::MTHI64;
+      else
+        LdOp = Mips::MTLO64;
+    }
+
+    BuildMI(MBB, I, DL, get(Opc), Reg)
+        .addFrameIndex(FI)
+        .addImm(Offset)
+        .addMemOperand(MMO);
+    BuildMI(MBB, I, DL, get(LdOp)).addReg(Reg);
+  }
 }
 
 bool MipsSEInstrInfo::expandPostRAPseudo(MachineBasicBlock::iterator MI) const {
@@ -269,6 +336,9 @@ bool MipsSEInstrInfo::expandPostRAPseudo(MachineBasicBlock::iterator MI) const {
     return false;
   case Mips::RetRA:
     expandRetRA(MBB, MI);
+    break;
+  case Mips::ERet:
+    expandERet(MBB, MI);
     break;
   case Mips::PseudoMFHI:
     Opc = isMicroMips ? Mips::MFHI16_MM : Mips::MFHI;
@@ -351,6 +421,14 @@ unsigned MipsSEInstrInfo::getOppositeBranchOpc(unsigned Opc) const {
   case Mips::BC1F:   return Mips::BC1T;
   case Mips::BEQZC_MM: return Mips::BNEZC_MM;
   case Mips::BNEZC_MM: return Mips::BEQZC_MM;
+  case Mips::BEQZC:  return Mips::BNEZC;
+  case Mips::BNEZC:  return Mips::BEQZC;
+  case Mips::BEQC:   return Mips::BNEC;
+  case Mips::BNEC:   return Mips::BEQC;
+  case Mips::BGTZC:  return Mips::BLEZC;
+  case Mips::BGEZC:  return Mips::BLTZC;
+  case Mips::BLTZC:  return Mips::BGEZC;
+  case Mips::BLEZC:  return Mips::BGTZC;
   }
 }
 
@@ -424,8 +502,12 @@ unsigned MipsSEInstrInfo::getAnalyzableBrOpc(unsigned Opc) const {
           Opc == Mips::BEQ64  || Opc == Mips::BNE64  || Opc == Mips::BGTZ64 ||
           Opc == Mips::BGEZ64 || Opc == Mips::BLTZ64 || Opc == Mips::BLEZ64 ||
           Opc == Mips::BC1T   || Opc == Mips::BC1F   || Opc == Mips::B      ||
-          Opc == Mips::J || Opc == Mips::BEQZC_MM || Opc == Mips::BNEZC_MM) ?
-         Opc : 0;
+          Opc == Mips::J  || Opc == Mips::BEQZC_MM || Opc == Mips::BNEZC_MM ||
+          Opc == Mips::BEQC   || Opc == Mips::BNEC   || Opc == Mips::BLTC   ||
+          Opc == Mips::BGEC   || Opc == Mips::BLTUC  || Opc == Mips::BGEUC  ||
+          Opc == Mips::BGTZC  || Opc == Mips::BLEZC  || Opc == Mips::BGEZC  ||
+          Opc == Mips::BGTZC  || Opc == Mips::BEQZC  || Opc == Mips::BNEZC  ||
+          Opc == Mips::BC) ? Opc : 0;
 }
 
 void MipsSEInstrInfo::expandRetRA(MachineBasicBlock &MBB,
@@ -435,6 +517,11 @@ void MipsSEInstrInfo::expandRetRA(MachineBasicBlock &MBB,
         .addReg(Mips::RA_64);
   else
     BuildMI(MBB, I, I->getDebugLoc(), get(Mips::PseudoReturn)).addReg(Mips::RA);
+}
+
+void MipsSEInstrInfo::expandERet(MachineBasicBlock &MBB,
+                                 MachineBasicBlock::iterator I) const {
+  BuildMI(MBB, I, I->getDebugLoc(), get(Mips::ERET));
 }
 
 std::pair<bool, bool>
@@ -470,8 +557,6 @@ void MipsSEInstrInfo::expandPseudoMTLoHi(MachineBasicBlock &MBB,
   const MachineOperand &SrcLo = I->getOperand(1), &SrcHi = I->getOperand(2);
   MachineInstrBuilder LoInst = BuildMI(MBB, I, DL, get(LoOpc));
   MachineInstrBuilder HiInst = BuildMI(MBB, I, DL, get(HiOpc));
-  LoInst.addReg(SrcLo.getReg(), getKillRegState(SrcLo.isKill()));
-  HiInst.addReg(SrcHi.getReg(), getKillRegState(SrcHi.isKill()));
 
   // Add lo/hi registers if the mtlo/hi instructions created have explicit
   // def registers.
@@ -482,6 +567,9 @@ void MipsSEInstrInfo::expandPseudoMTLoHi(MachineBasicBlock &MBB,
     LoInst.addReg(DstLo, RegState::Define);
     HiInst.addReg(DstHi, RegState::Define);
   }
+
+  LoInst.addReg(SrcLo.getReg(), getKillRegState(SrcLo.isKill()));
+  HiInst.addReg(SrcHi.getReg(), getKillRegState(SrcHi.isKill()));
 }
 
 void MipsSEInstrInfo::expandCvtFPInt(MachineBasicBlock &MBB,

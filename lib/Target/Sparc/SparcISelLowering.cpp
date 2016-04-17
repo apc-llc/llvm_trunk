@@ -400,6 +400,7 @@ LowerFormalArguments_32(SDValue Chain,
   CCInfo.AnalyzeFormalArguments(Ins, CC_Sparc32);
 
   const unsigned StackOffset = 92;
+  bool IsLittleEndian = DAG.getDataLayout().isLittleEndian();
 
   unsigned InIdx = 0;
   for (unsigned i = 0, e = ArgLocs.size(); i != e; ++i, ++InIdx) {
@@ -442,6 +443,10 @@ LowerFormalArguments_32(SDValue Chain,
                                         &SP::IntRegsRegClass);
           LoVal = DAG.getCopyFromReg(Chain, dl, loReg, MVT::i32);
         }
+
+        if (IsLittleEndian)
+          std::swap(LoVal, HiVal);
+
         SDValue WholeValue =
           DAG.getNode(ISD::BUILD_PAIR, dl, MVT::i64, LoVal, HiVal);
         WholeValue = DAG.getNode(ISD::BITCAST, dl, VA.getLocVT(), WholeValue);
@@ -468,7 +473,7 @@ LowerFormalArguments_32(SDValue Chain,
     auto PtrVT = getPointerTy(DAG.getDataLayout());
 
     if (VA.needsCustom()) {
-      assert(VA.getValVT() == MVT::f64 || MVT::v2i32);
+      assert(VA.getValVT() == MVT::f64 || VA.getValVT() == MVT::v2i32);
       // If it is double-word aligned, just load.
       if (Offset % 8 == 0) {
         int FI = MF.getFrameInfo()->CreateFixedObject(8,
@@ -498,6 +503,9 @@ LowerFormalArguments_32(SDValue Chain,
                                   MachinePointerInfo(),
                                   false, false, false, 0);
 
+      if (IsLittleEndian)
+        std::swap(LoVal, HiVal);
+
       SDValue WholeValue =
         DAG.getNode(ISD::BUILD_PAIR, dl, MVT::i64, LoVal, HiVal);
       WholeValue = DAG.getNode(ISD::BITCAST, dl, VA.getValVT(), WholeValue);
@@ -514,16 +522,12 @@ LowerFormalArguments_32(SDValue Chain,
       Load = DAG.getLoad(VA.getValVT(), dl, Chain, FIPtr,
                          MachinePointerInfo(),
                          false, false, false, 0);
+    } else if (VA.getValVT() == MVT::f128) {
+      report_fatal_error("SPARCv8 does not handle f128 in calls; "
+                         "pass indirectly");
     } else {
-      ISD::LoadExtType LoadOp = ISD::SEXTLOAD;
-      // Sparc is big endian, so add an offset based on the ObjectVT.
-      unsigned Offset = 4-std::max(1U, VA.getValVT().getSizeInBits()/8);
-      FIPtr = DAG.getNode(ISD::ADD, dl, MVT::i32, FIPtr,
-                          DAG.getConstant(Offset, dl, MVT::i32));
-      Load = DAG.getExtLoad(LoadOp, dl, MVT::i32, Chain, FIPtr,
-                            MachinePointerInfo(),
-                            VA.getValVT(), false, false, false,0);
-      Load = DAG.getNode(ISD::TRUNCATE, dl, VA.getValVT(), Load);
+      // We shouldn't see any other value types here.
+      llvm_unreachable("Unexpected ValVT encountered in frame lowering.");
     }
     InVals.push_back(Load);
   }
@@ -854,11 +858,10 @@ SparcTargetLowering::LowerCall_32(TargetLowering::CallLoweringInfo &CLI,
         // Move from the float value from float registers into the
         // integer registers.
 
-        // TODO: this conversion is done in two steps, because
-        // f64->i64 conversion is done efficiently, and i64->v2i32 is
-        // basically a no-op. But f64->v2i32 is NOT done efficiently
-        // for some reason.
-        Arg = DAG.getNode(ISD::BITCAST, dl, MVT::i64, Arg);
+        // TODO: The f64 -> v2i32 conversion is super-inefficient for
+        // constants: it sticks them in the constant pool, then loads
+        // to a fp register, then stores to temp memory, then loads to
+        // integer registers.
         Arg = DAG.getNode(ISD::BITCAST, dl, MVT::v2i32, Arg);
       }
 
@@ -996,10 +999,29 @@ SparcTargetLowering::LowerCall_32(TargetLowering::CallLoweringInfo &CLI,
 
   // Copy all of the result registers out of their specified physreg.
   for (unsigned i = 0; i != RVLocs.size(); ++i) {
-    Chain = DAG.getCopyFromReg(Chain, dl, toCallerWindow(RVLocs[i].getLocReg()),
-                               RVLocs[i].getValVT(), InFlag).getValue(1);
-    InFlag = Chain.getValue(2);
-    InVals.push_back(Chain.getValue(0));
+    if (RVLocs[i].getLocVT() == MVT::v2i32) {
+      SDValue Vec = DAG.getNode(ISD::UNDEF, dl, MVT::v2i32);
+      SDValue Lo = DAG.getCopyFromReg(
+          Chain, dl, toCallerWindow(RVLocs[i++].getLocReg()), MVT::i32, InFlag);
+      Chain = Lo.getValue(1);
+      InFlag = Lo.getValue(2);
+      Vec = DAG.getNode(ISD::INSERT_VECTOR_ELT, dl, MVT::v2i32, Vec, Lo,
+                        DAG.getConstant(0, dl, MVT::i32));
+      SDValue Hi = DAG.getCopyFromReg(
+          Chain, dl, toCallerWindow(RVLocs[i].getLocReg()), MVT::i32, InFlag);
+      Chain = Hi.getValue(1);
+      InFlag = Hi.getValue(2);
+      Vec = DAG.getNode(ISD::INSERT_VECTOR_ELT, dl, MVT::v2i32, Vec, Hi,
+                        DAG.getConstant(1, dl, MVT::i32));
+      InVals.push_back(Vec);
+    } else {
+      Chain =
+          DAG.getCopyFromReg(Chain, dl, toCallerWindow(RVLocs[i].getLocReg()),
+                             RVLocs[i].getValVT(), InFlag)
+              .getValue(1);
+      InFlag = Chain.getValue(2);
+      InVals.push_back(Chain.getValue(0));
+    }
   }
 
   return Chain;
@@ -1041,8 +1063,8 @@ SparcTargetLowering::getSRetArgSize(SelectionDAG &DAG, SDValue Callee) const
   if (!CalleeFn)
     return 0;
 
-  assert(CalleeFn->hasStructRetAttr() &&
-         "Callee does not have the StructRet attribute.");
+  // It would be nice to check for the sret attribute on CalleeFn here,
+  // but since it is not part of the function type, any check will misfire.
 
   PointerType *Ty = cast<PointerType>(CalleeFn->arg_begin()->getType());
   Type *ElementTy = Ty->getElementType();
@@ -1128,7 +1150,7 @@ SparcTargetLowering::LowerCall_64(TargetLowering::CallLoweringInfo &CLI,
   unsigned ArgsSize = std::max(6*8u, CCInfo.getNextStackOffset());
 
   // Keep stack frames 16-byte aligned.
-  ArgsSize = RoundUpToAlignment(ArgsSize, 16);
+  ArgsSize = alignTo(ArgsSize, 16);
 
   // Varargs calls require special treatment.
   if (CLI.IsVarArg)
@@ -1372,6 +1394,14 @@ SparcTargetLowering::LowerCall_64(TargetLowering::CallLoweringInfo &CLI,
 // TargetLowering Implementation
 //===----------------------------------------------------------------------===//
 
+TargetLowering::AtomicExpansionKind SparcTargetLowering::shouldExpandAtomicRMWInIR(AtomicRMWInst *AI) const {
+  if (AI->getOperation() == AtomicRMWInst::Xchg &&
+      AI->getType()->getPrimitiveSizeInBits() == 32)
+    return AtomicExpansionKind::None; // Uses xchg instruction
+
+  return AtomicExpansionKind::CmpXChg;
+}
+
 /// IntCondCCodeToICC - Convert a DAG integer condition code to a SPARC ICC
 /// condition.
 static SPCC::CondCodes IntCondCCodeToICC(ISD::CondCode CC) {
@@ -1581,10 +1611,13 @@ SparcTargetLowering::SparcTargetLowering(TargetMachine &TM,
   }
 
   // ATOMICs.
-  // FIXME: We insert fences for each atomics and generate sub-optimal code
-  // for PSO/TSO. Also, implement other atomicrmw operations.
-
-  setInsertFencesForAtomic(true);
+  // Atomics are only supported on Sparcv9. (32bit atomics are also
+  // supported by the Leon sparcv8 variant, but we don't support that
+  // yet.)
+  if (Subtarget->isV9())
+    setMaxAtomicSizeInBitsSupported(64);
+  else
+    setMaxAtomicSizeInBitsSupported(0);
 
   setOperationAction(ISD::ATOMIC_SWAP, MVT::i32, Legal);
   setOperationAction(ISD::ATOMIC_CMP_SWAP, MVT::i32,
@@ -1674,9 +1707,6 @@ SparcTargetLowering::SparcTargetLowering(TargetMachine &TM,
   setOperationAction(ISD::STACKSAVE         , MVT::Other, Expand);
   setOperationAction(ISD::STACKRESTORE      , MVT::Other, Expand);
   setOperationAction(ISD::DYNAMIC_STACKALLOC, MVT::i32  , Custom);
-
-  setExceptionPointerRegister(SP::I0);
-  setExceptionSelectorRegister(SP::I1);
 
   setStackPointerRegisterToSaveRestore(SP::O6);
 
@@ -1840,18 +1870,15 @@ void SparcTargetLowering::computeKnownBitsForTargetNode
 // set LHS/RHS and SPCC to the LHS/RHS of the setcc and SPCC to the condition.
 static void LookThroughSetCC(SDValue &LHS, SDValue &RHS,
                              ISD::CondCode CC, unsigned &SPCC) {
-  if (isa<ConstantSDNode>(RHS) &&
-      cast<ConstantSDNode>(RHS)->isNullValue() &&
+  if (isNullConstant(RHS) &&
       CC == ISD::SETNE &&
       (((LHS.getOpcode() == SPISD::SELECT_ICC ||
          LHS.getOpcode() == SPISD::SELECT_XCC) &&
         LHS.getOperand(3).getOpcode() == SPISD::CMPICC) ||
        (LHS.getOpcode() == SPISD::SELECT_FCC &&
         LHS.getOperand(3).getOpcode() == SPISD::CMPFCC)) &&
-      isa<ConstantSDNode>(LHS.getOperand(0)) &&
-      isa<ConstantSDNode>(LHS.getOperand(1)) &&
-      cast<ConstantSDNode>(LHS.getOperand(0))->isOne() &&
-      cast<ConstantSDNode>(LHS.getOperand(1))->isNullValue()) {
+      isOneConstant(LHS.getOperand(0)) &&
+      isNullConstant(LHS.getOperand(1))) {
     SDValue CMPCC = LHS.getOperand(3);
     SPCC = cast<ConstantSDNode>(LHS.getOperand(2))->getZExtValue();
     LHS = CMPCC.getOperand(0);
@@ -2655,7 +2682,7 @@ static SDValue LowerF128Load(SDValue Op, SelectionDAG &DAG)
 {
   SDLoc dl(Op);
   LoadSDNode *LdNode = dyn_cast<LoadSDNode>(Op.getNode());
-  assert(LdNode && LdNode->getOffset().getOpcode() == ISD::UNDEF
+  assert(LdNode && LdNode->getOffset().isUndef()
          && "Unexpected node type");
 
   unsigned alignment = LdNode->getAlignment();
@@ -2716,7 +2743,7 @@ static SDValue LowerLOAD(SDValue Op, SelectionDAG &DAG)
 static SDValue LowerF128Store(SDValue Op, SelectionDAG &DAG) {
   SDLoc dl(Op);
   StoreSDNode *StNode = dyn_cast<StoreSDNode>(Op.getNode());
-  assert(StNode && StNode->getOffset().getOpcode() == ISD::UNDEF
+  assert(StNode && StNode->getOffset().isUndef()
          && "Unexpected node type");
   SDValue SubRegEven = DAG.getTargetConstant(SP::sub_even64, dl, MVT::i32);
   SDValue SubRegOdd  = DAG.getTargetConstant(SP::sub_odd64, dl, MVT::i32);
@@ -2886,7 +2913,7 @@ static SDValue LowerUMULO_SMULO(SDValue Op, SelectionDAG &DAG,
 
   SDValue MulResult = TLI.makeLibCall(DAG,
                                       RTLIB::MUL_I128, WideVT,
-                                      Args, 4, isSigned, dl).first;
+                                      Args, isSigned, dl).first;
   SDValue BottomHalf = DAG.getNode(ISD::EXTRACT_ELEMENT, dl, VT,
                                    MulResult, DAG.getIntPtrConstant(0, dl));
   SDValue TopHalf = DAG.getNode(ISD::EXTRACT_ELEMENT, dl, VT,
@@ -2909,12 +2936,12 @@ static SDValue LowerUMULO_SMULO(SDValue Op, SelectionDAG &DAG,
 }
 
 static SDValue LowerATOMIC_LOAD_STORE(SDValue Op, SelectionDAG &DAG) {
-  // Monotonic load/stores are legal.
-  if (cast<AtomicSDNode>(Op)->getOrdering() <= Monotonic)
-    return Op;
-
-  // Otherwise, expand with a fence.
+  if (isStrongerThanMonotonic(cast<AtomicSDNode>(Op)->getOrdering()))
+  // Expand with a fence.
   return SDValue();
+
+  // Monotonic load/stores are legal.
+  return Op;
 }
 
 SDValue SparcTargetLowering::
@@ -2993,51 +3020,6 @@ SparcTargetLowering::EmitInstrWithCustomInserter(MachineInstr *MI,
   case SP::SELECT_CC_DFP_FCC:
   case SP::SELECT_CC_QFP_FCC:
     return expandSelectCC(MI, BB, SP::FBCOND);
-
-  case SP::ATOMIC_LOAD_ADD_32:
-    return expandAtomicRMW(MI, BB, SP::ADDrr);
-  case SP::ATOMIC_LOAD_ADD_64:
-    return expandAtomicRMW(MI, BB, SP::ADDXrr);
-  case SP::ATOMIC_LOAD_SUB_32:
-    return expandAtomicRMW(MI, BB, SP::SUBrr);
-  case SP::ATOMIC_LOAD_SUB_64:
-    return expandAtomicRMW(MI, BB, SP::SUBXrr);
-  case SP::ATOMIC_LOAD_AND_32:
-    return expandAtomicRMW(MI, BB, SP::ANDrr);
-  case SP::ATOMIC_LOAD_AND_64:
-    return expandAtomicRMW(MI, BB, SP::ANDXrr);
-  case SP::ATOMIC_LOAD_OR_32:
-    return expandAtomicRMW(MI, BB, SP::ORrr);
-  case SP::ATOMIC_LOAD_OR_64:
-    return expandAtomicRMW(MI, BB, SP::ORXrr);
-  case SP::ATOMIC_LOAD_XOR_32:
-    return expandAtomicRMW(MI, BB, SP::XORrr);
-  case SP::ATOMIC_LOAD_XOR_64:
-    return expandAtomicRMW(MI, BB, SP::XORXrr);
-  case SP::ATOMIC_LOAD_NAND_32:
-    return expandAtomicRMW(MI, BB, SP::ANDrr);
-  case SP::ATOMIC_LOAD_NAND_64:
-    return expandAtomicRMW(MI, BB, SP::ANDXrr);
-
-  case SP::ATOMIC_SWAP_64:
-    return expandAtomicRMW(MI, BB, 0);
-
-  case SP::ATOMIC_LOAD_MAX_32:
-    return expandAtomicRMW(MI, BB, SP::MOVICCrr, SPCC::ICC_G);
-  case SP::ATOMIC_LOAD_MAX_64:
-    return expandAtomicRMW(MI, BB, SP::MOVXCCrr, SPCC::ICC_G);
-  case SP::ATOMIC_LOAD_MIN_32:
-    return expandAtomicRMW(MI, BB, SP::MOVICCrr, SPCC::ICC_LE);
-  case SP::ATOMIC_LOAD_MIN_64:
-    return expandAtomicRMW(MI, BB, SP::MOVXCCrr, SPCC::ICC_LE);
-  case SP::ATOMIC_LOAD_UMAX_32:
-    return expandAtomicRMW(MI, BB, SP::MOVICCrr, SPCC::ICC_GU);
-  case SP::ATOMIC_LOAD_UMAX_64:
-    return expandAtomicRMW(MI, BB, SP::MOVXCCrr, SPCC::ICC_GU);
-  case SP::ATOMIC_LOAD_UMIN_32:
-    return expandAtomicRMW(MI, BB, SP::MOVICCrr, SPCC::ICC_LEU);
-  case SP::ATOMIC_LOAD_UMIN_64:
-    return expandAtomicRMW(MI, BB, SP::MOVXCCrr, SPCC::ICC_LEU);
   }
 }
 
@@ -3054,8 +3036,7 @@ SparcTargetLowering::expandSelectCC(MachineInstr *MI,
   // to set, the condition code register to branch on, the true/false values to
   // select between, and a branch opcode to use.
   const BasicBlock *LLVM_BB = BB->getBasicBlock();
-  MachineFunction::iterator It = BB;
-  ++It;
+  MachineFunction::iterator It = ++BB->getIterator();
 
   //  thisMBB:
   //  ...
@@ -3099,101 +3080,6 @@ SparcTargetLowering::expandSelectCC(MachineInstr *MI,
 
   MI->eraseFromParent();   // The pseudo instruction is gone now.
   return BB;
-}
-
-MachineBasicBlock*
-SparcTargetLowering::expandAtomicRMW(MachineInstr *MI,
-                                     MachineBasicBlock *MBB,
-                                     unsigned Opcode,
-                                     unsigned CondCode) const {
-  const TargetInstrInfo &TII = *Subtarget->getInstrInfo();
-  MachineRegisterInfo &MRI = MBB->getParent()->getRegInfo();
-  DebugLoc DL = MI->getDebugLoc();
-
-  // MI is an atomic read-modify-write instruction of the form:
-  //
-  //   rd = atomicrmw<op> addr, rs2
-  //
-  // All three operands are registers.
-  unsigned DestReg = MI->getOperand(0).getReg();
-  unsigned AddrReg = MI->getOperand(1).getReg();
-  unsigned Rs2Reg  = MI->getOperand(2).getReg();
-
-  // SelectionDAG has already inserted memory barriers before and after MI, so
-  // we simply have to implement the operatiuon in terms of compare-and-swap.
-  //
-  //   %val0 = load %addr
-  // loop:
-  //   %val = phi %val0, %dest
-  //   %upd = op %val, %rs2
-  //   %dest = cas %addr, %val, %upd
-  //   cmp %val, %dest
-  //   bne loop
-  // done:
-  //
-  bool is64Bit = SP::I64RegsRegClass.hasSubClassEq(MRI.getRegClass(DestReg));
-  const TargetRegisterClass *ValueRC =
-    is64Bit ? &SP::I64RegsRegClass : &SP::IntRegsRegClass;
-  unsigned Val0Reg = MRI.createVirtualRegister(ValueRC);
-
-  BuildMI(*MBB, MI, DL, TII.get(is64Bit ? SP::LDXri : SP::LDri), Val0Reg)
-    .addReg(AddrReg).addImm(0);
-
-  // Split the basic block MBB before MI and insert the loop block in the hole.
-  MachineFunction::iterator MFI = MBB;
-  const BasicBlock *LLVM_BB = MBB->getBasicBlock();
-  MachineFunction *MF = MBB->getParent();
-  MachineBasicBlock *LoopMBB = MF->CreateMachineBasicBlock(LLVM_BB);
-  MachineBasicBlock *DoneMBB = MF->CreateMachineBasicBlock(LLVM_BB);
-  ++MFI;
-  MF->insert(MFI, LoopMBB);
-  MF->insert(MFI, DoneMBB);
-
-  // Move MI and following instructions to DoneMBB.
-  DoneMBB->splice(DoneMBB->begin(), MBB, MI, MBB->end());
-  DoneMBB->transferSuccessorsAndUpdatePHIs(MBB);
-
-  // Connect the CFG again.
-  MBB->addSuccessor(LoopMBB);
-  LoopMBB->addSuccessor(LoopMBB);
-  LoopMBB->addSuccessor(DoneMBB);
-
-  // Build the loop block.
-  unsigned ValReg = MRI.createVirtualRegister(ValueRC);
-  // Opcode == 0 means try to write Rs2Reg directly (ATOMIC_SWAP).
-  unsigned UpdReg = (Opcode ? MRI.createVirtualRegister(ValueRC) : Rs2Reg);
-
-  BuildMI(LoopMBB, DL, TII.get(SP::PHI), ValReg)
-    .addReg(Val0Reg).addMBB(MBB)
-    .addReg(DestReg).addMBB(LoopMBB);
-
-  if (CondCode) {
-    // This is one of the min/max operations. We need a CMPrr followed by a
-    // MOVXCC/MOVICC.
-    BuildMI(LoopMBB, DL, TII.get(SP::CMPrr)).addReg(ValReg).addReg(Rs2Reg);
-    BuildMI(LoopMBB, DL, TII.get(Opcode), UpdReg)
-      .addReg(ValReg).addReg(Rs2Reg).addImm(CondCode);
-  } else if (Opcode) {
-    BuildMI(LoopMBB, DL, TII.get(Opcode), UpdReg)
-      .addReg(ValReg).addReg(Rs2Reg);
-  }
-
-  if (MI->getOpcode() == SP::ATOMIC_LOAD_NAND_32 ||
-      MI->getOpcode() == SP::ATOMIC_LOAD_NAND_64) {
-    unsigned TmpReg = UpdReg;
-    UpdReg = MRI.createVirtualRegister(ValueRC);
-    BuildMI(LoopMBB, DL, TII.get(SP::XORri), UpdReg).addReg(TmpReg).addImm(-1);
-  }
-
-  BuildMI(LoopMBB, DL, TII.get(is64Bit ? SP::CASXrr : SP::CASrr), DestReg)
-    .addReg(AddrReg).addReg(ValReg).addReg(UpdReg)
-    .setMemRefs(MI->memoperands_begin(), MI->memoperands_end());
-  BuildMI(LoopMBB, DL, TII.get(SP::CMPrr)).addReg(ValReg).addReg(DestReg);
-  BuildMI(LoopMBB, DL, TII.get(is64Bit ? SP::BPXCC : SP::BCOND))
-    .addMBB(LoopMBB).addImm(SPCC::ICC_NE);
-
-  MI->eraseFromParent();
-  return DoneMBB;
 }
 
 //===----------------------------------------------------------------------===//

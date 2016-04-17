@@ -34,10 +34,12 @@ template <class PtrType> class SmallPtrSetImpl;
 /// This wraps the function in the appropriate structure and stores it along
 /// side other global constructors. For details see
 /// http://llvm.org/docs/LangRef.html#intg_global_ctors
-void appendToGlobalCtors(Module &M, Function *F, int Priority);
+void appendToGlobalCtors(Module &M, Function *F, int Priority,
+                         Constant *Data = nullptr);
 
 /// Same as appendToGlobalCtors(), but for global dtors.
-void appendToGlobalDtors(Module &M, Function *F, int Priority);
+void appendToGlobalDtors(Module &M, Function *F, int Priority,
+                         Constant *Data = nullptr);
 
 /// \brief Given "llvm.used" or "llvm.compiler.used" as a global name, collect
 /// the initializer elements of that global in Set and return the global itself.
@@ -59,6 +61,11 @@ std::pair<Function *, Function *> createSanitizerCtorAndInitFunctions(
     Module &M, StringRef CtorName, StringRef InitName,
     ArrayRef<Type *> InitArgTypes, ArrayRef<Value *> InitArgs,
     StringRef VersionCheckName = StringRef());
+
+/// Rename all the anon functions in the module using a hash computed from
+/// the list of public globals in the module.
+bool nameUnamedFunctions(Module &M);
+
 } // End llvm namespace
 
 #endif //  LLVM_TRANSFORMS_UTILS_MODULEUTILS_H

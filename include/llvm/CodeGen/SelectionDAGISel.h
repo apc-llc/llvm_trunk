@@ -140,6 +140,7 @@ public:
     OPC_EmitMergeInputChains,
     OPC_EmitMergeInputChains1_0,
     OPC_EmitMergeInputChains1_1,
+    OPC_EmitMergeInputChains1_2,
     OPC_EmitCopyToReg,
     OPC_EmitNodeXForm,
     OPC_EmitNode,
@@ -264,7 +265,6 @@ private:
   /// personality specific tasks. Returns true if the block should be
   /// instruction selected, false if no code should be emitted for it.
   bool PrepareEHLandingPad();
-  bool PrepareEHPad();
 
   /// \brief Perform instruction selection on all basic blocks in the function.
   void SelectAllBasicBlocks(const Function &Fn);

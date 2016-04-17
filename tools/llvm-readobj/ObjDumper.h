@@ -39,7 +39,11 @@ public:
   virtual void printNeededLibraries() { }
   virtual void printProgramHeaders() { }
   virtual void printHashTable() { }
+  virtual void printGnuHashTable() { }
   virtual void printLoadName() {}
+  virtual void printVersionInfo() {}
+  virtual void printGroupSections() {}
+  virtual void printHashHistogram() {}
 
   // Only implemented for ARM ELF at this time.
   virtual void printAttributes() { }
@@ -54,6 +58,7 @@ public:
   virtual void printCOFFExports() { }
   virtual void printCOFFDirectives() { }
   virtual void printCOFFBaseReloc() { }
+  virtual void printCodeViewDebugInfo() { }
 
   // Only implemented for MachO.
   virtual void printMachODataInCode() { }
@@ -61,6 +66,7 @@ public:
   virtual void printMachODysymtab() { }
   virtual void printMachOSegment() { }
   virtual void printMachOIndirectSymbols() { }
+  virtual void printMachOLinkerOptions() { }
 
   virtual void printStackMap() const = 0;
 

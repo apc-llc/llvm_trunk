@@ -17,6 +17,7 @@
 #define LLVM_IR_INTRINSICS_H
 
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/None.h"
 #include <string>
 
 namespace llvm {
@@ -68,6 +69,13 @@ namespace Intrinsic {
   /// intrinsic, Tys must provide exactly one type for each overloaded type in
   /// the intrinsic.
   Function *getDeclaration(Module *M, ID id, ArrayRef<Type*> Tys = None);
+
+  /// Looks up Name in NameTable via binary search. NameTable must be sorted
+  /// and all entries must start with "llvm.".  If NameTable contains an exact
+  /// match for Name or a prefix of Name followed by a dot, its index in
+  /// NameTable is returned. Otherwise, -1 is returned.
+  int lookupLLVMIntrinsicByName(ArrayRef<const char *> NameTable,
+                                StringRef Name);
 
   /// Map a GCC builtin name to an intrinsic ID.
   ID getIntrinsicForGCCBuiltin(const char *Prefix, const char *BuiltinName);

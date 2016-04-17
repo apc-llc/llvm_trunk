@@ -26,16 +26,26 @@
 
 using namespace llvm;
 
-static cl:: opt<bool> DisableHardwareLoops("disable-hexagon-hwloops",
+
+static cl::opt<bool> EnableRDFOpt("rdf-opt", cl::Hidden, cl::ZeroOrMore,
+  cl::init(true), cl::desc("Enable RDF-based optimizations"));
+
+static cl::opt<bool> DisableHardwareLoops("disable-hexagon-hwloops",
   cl::Hidden, cl::desc("Disable Hardware Loops for Hexagon target"));
 
 static cl::opt<bool> DisableHexagonCFGOpt("disable-hexagon-cfgopt",
   cl::Hidden, cl::ZeroOrMore, cl::init(false),
   cl::desc("Disable Hexagon CFG Optimization"));
 
+static cl::opt<bool> DisableStoreWidening("disable-store-widen",
+  cl::Hidden, cl::init(false), cl::desc("Disable store widening"));
+
 static cl::opt<bool> EnableExpandCondsets("hexagon-expand-condsets",
   cl::init(true), cl::Hidden, cl::ZeroOrMore,
   cl::desc("Early expansion of MUX"));
+
+static cl::opt<bool> EnableEarlyIf("hexagon-eif", cl::init(true), cl::Hidden,
+  cl::ZeroOrMore, cl::desc("Enable early if-conversion"));
 
 static cl::opt<bool> EnableGenInsert("hexagon-insert", cl::init(true),
   cl::Hidden, cl::desc("Generate \"insert\" instructions"));
@@ -52,6 +62,15 @@ static cl::opt<bool> EnableGenMux("hexagon-mux", cl::init(true), cl::Hidden,
 static cl::opt<bool> EnableGenPred("hexagon-gen-pred", cl::init(true),
   cl::Hidden, cl::desc("Enable conversion of arithmetic operations to "
   "predicate instructions"));
+
+static cl::opt<bool> DisableHSDR("disable-hsdr", cl::init(false), cl::Hidden,
+  cl::desc("Disable splitting double registers"));
+
+static cl::opt<bool> EnableBitSimplify("hexagon-bit", cl::init(true),
+  cl::Hidden, cl::desc("Bit simplification"));
+
+static cl::opt<bool> EnableLoopResched("hexagon-loop-resched", cl::init(true),
+  cl::Hidden, cl::desc("Loop rescheduling"));
 
 /// HexagonTargetMachineModule - Note that this is used on hosts that
 /// cannot link in a library unless there are references into the
@@ -75,11 +94,13 @@ SchedCustomRegistry("hexagon", "Run Hexagon's custom scheduler",
                     createVLIWMachineSched);
 
 namespace llvm {
+  FunctionPass *createHexagonBitSimplify();
+  FunctionPass *createHexagonCallFrameInformation();
   FunctionPass *createHexagonCFGOptimizer();
   FunctionPass *createHexagonCommonGEP();
   FunctionPass *createHexagonCopyToCombine();
+  FunctionPass *createHexagonEarlyIfConversion();
   FunctionPass *createHexagonExpandCondsets();
-  FunctionPass *createHexagonExpandPredSpillCode();
   FunctionPass *createHexagonFixupHwLoops();
   FunctionPass *createHexagonGenExtract();
   FunctionPass *createHexagonGenInsert();
@@ -88,25 +109,30 @@ namespace llvm {
   FunctionPass *createHexagonHardwareLoops();
   FunctionPass *createHexagonISelDag(HexagonTargetMachine &TM,
                                      CodeGenOpt::Level OptLevel);
+  FunctionPass *createHexagonLoopRescheduling();
   FunctionPass *createHexagonNewValueJump();
+  FunctionPass *createHexagonOptimizeSZextends();
   FunctionPass *createHexagonPacketizer();
   FunctionPass *createHexagonPeephole();
-  FunctionPass *createHexagonRemoveExtendArgs(const HexagonTargetMachine &TM);
+  FunctionPass *createHexagonRDFOpt();
   FunctionPass *createHexagonSplitConst32AndConst64();
+  FunctionPass *createHexagonSplitDoubleRegs();
+  FunctionPass *createHexagonStoreWidening();
 } // end namespace llvm;
 
-/// HexagonTargetMachine ctor - Create an ILP32 architecture model.
-///
 
-/// Hexagon_TODO: Do I need an aggregate alignment?
-///
 HexagonTargetMachine::HexagonTargetMachine(const Target &T, const Triple &TT,
                                            StringRef CPU, StringRef FS,
                                            const TargetOptions &Options,
                                            Reloc::Model RM, CodeModel::Model CM,
                                            CodeGenOpt::Level OL)
-    : LLVMTargetMachine(T, "e-m:e-p:32:32-i1:32-i64:64-a:0-n32", TT, CPU, FS,
-                        Options, RM, CM, OL),
+    // Specify the vector alignment explicitly. For v512x1, the calculated
+    // alignment would be 512*alignment(i1), which is 512 bytes, instead of
+    // the required minimum of 64 bytes.
+    : LLVMTargetMachine(T, "e-m:e-p:32:32:32-a:0-n16:32-"
+         "i64:64:64-i32:32:32-i16:16:16-i1:8:8-f32:32:32-f64:64:64-"
+         "v32:32:32-v64:64:64-v512:512:512-v1024:1024:1024-v2048:2048:2048",
+         TT, CPU, FS, Options, RM, CM, OL),
       TLOF(make_unique<HexagonTargetObjectFile>()) {
   initAsmInfo();
 }
@@ -138,7 +164,7 @@ HexagonTargetMachine::getSubtargetImpl(const Function &F) const {
 }
 
 TargetIRAnalysis HexagonTargetMachine::getTargetIRAnalysis() {
-  return TargetIRAnalysis([this](Function &F) {
+  return TargetIRAnalysis([this](const Function &F) {
     return TargetTransformInfo(HexagonTTIImpl(this, F));
   });
 }
@@ -202,7 +228,7 @@ bool HexagonPassConfig::addInstSelector() {
   bool NoOpt = (getOptLevel() == CodeGenOpt::None);
 
   if (!NoOpt)
-    addPass(createHexagonRemoveExtendArgs(TM));
+    addPass(createHexagonOptimizeSZextends());
 
   addPass(createHexagonISelDag(TM, getOptLevel()));
 
@@ -210,25 +236,42 @@ bool HexagonPassConfig::addInstSelector() {
     // Create logical operations on predicate registers.
     if (EnableGenPred)
       addPass(createHexagonGenPredicate(), false);
+    // Rotate loops to expose bit-simplification opportunities.
+    if (EnableLoopResched)
+      addPass(createHexagonLoopRescheduling(), false);
+    // Split double registers.
+    if (!DisableHSDR)
+      addPass(createHexagonSplitDoubleRegs());
+    // Bit simplification.
+    if (EnableBitSimplify)
+      addPass(createHexagonBitSimplify(), false);
     addPass(createHexagonPeephole());
     printAndVerify("After hexagon peephole pass");
     if (EnableGenInsert)
       addPass(createHexagonGenInsert(), false);
+    if (EnableEarlyIf)
+      addPass(createHexagonEarlyIfConversion(), false);
   }
 
   return false;
 }
 
 void HexagonPassConfig::addPreRegAlloc() {
-  if (getOptLevel() != CodeGenOpt::None)
+  if (getOptLevel() != CodeGenOpt::None) {
+    if (!DisableStoreWidening)
+      addPass(createHexagonStoreWidening(), false);
     if (!DisableHardwareLoops)
       addPass(createHexagonHardwareLoops(), false);
+  }
 }
 
 void HexagonPassConfig::addPostRegAlloc() {
-  if (getOptLevel() != CodeGenOpt::None)
+  if (getOptLevel() != CodeGenOpt::None) {
+    if (EnableRDFOpt)
+      addPass(createHexagonRDFOpt());
     if (!DisableHexagonCFGOpt)
       addPass(createHexagonCFGOptimizer(), false);
+  }
 }
 
 void HexagonPassConfig::addPreSched2() {
@@ -244,9 +287,6 @@ void HexagonPassConfig::addPreEmitPass() {
   if (!NoOpt)
     addPass(createHexagonNewValueJump(), false);
 
-  // Expand Spill code for predicate registers.
-  addPass(createHexagonExpandPredSpillCode(), false);
-
   // Create Packets.
   if (!NoOpt) {
     if (!DisableHardwareLoops)
@@ -257,4 +297,7 @@ void HexagonPassConfig::addPreEmitPass() {
 
     addPass(createHexagonPacketizer(), false);
   }
+
+  // Add CFI instructions if necessary.
+  addPass(createHexagonCallFrameInformation(), false);
 }

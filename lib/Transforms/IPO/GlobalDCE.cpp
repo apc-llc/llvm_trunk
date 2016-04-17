@@ -205,9 +205,9 @@ void GlobalDCE::GlobalIsNeeded(GlobalValue *G) {
     // referenced by the initializer to the alive set.
     if (GV->hasInitializer())
       MarkUsedGlobalsAsNeeded(GV->getInitializer());
-  } else if (GlobalAlias *GA = dyn_cast<GlobalAlias>(G)) {
-    // The target of a global alias is needed.
-    MarkUsedGlobalsAsNeeded(GA->getAliasee());
+  } else if (GlobalIndirectSymbol *GIS = dyn_cast<GlobalIndirectSymbol>(G)) {
+    // The target of a global alias or ifunc is needed.
+    MarkUsedGlobalsAsNeeded(GIS->getIndirectSymbol());
   } else {
     // Otherwise this must be a function object.  We have to scan the body of
     // the function looking for constants and global values which are used as
@@ -215,14 +215,8 @@ void GlobalDCE::GlobalIsNeeded(GlobalValue *G) {
     // any globals used will be marked as needed.
     Function *F = cast<Function>(G);
 
-    if (F->hasPrefixData())
-      MarkUsedGlobalsAsNeeded(F->getPrefixData());
-
-    if (F->hasPrologueData())
-      MarkUsedGlobalsAsNeeded(F->getPrologueData());
-
-    if (F->hasPersonalityFn())
-      MarkUsedGlobalsAsNeeded(F->getPersonalityFn());
+    for (Use &U : F->operands())
+      MarkUsedGlobalsAsNeeded(cast<Constant>(U.get()));
 
     for (BasicBlock &BB : *F)
       for (Instruction &I : BB)

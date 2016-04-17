@@ -20,6 +20,7 @@
 #ifndef LLVM_ADT_SETVECTOR_H
 #define LLVM_ADT_SETVECTOR_H
 
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallSet.h"
 #include <algorithm>
 #include <cassert>
@@ -33,7 +34,7 @@ namespace llvm {
 /// property of a deterministic iteration order. The order of iteration is the
 /// order of insertion.
 template <typename T, typename Vector = std::vector<T>,
-                      typename Set = SmallSet<T, 16> >
+          typename Set = DenseSet<T>>
 class SetVector {
 public:
   typedef T value_type;
@@ -56,6 +57,8 @@ public:
   SetVector(It Start, It End) {
     insert(Start, End);
   }
+
+  ArrayRef<T> getArrayRef() const { return vector_; }
 
   /// \brief Determine if the SetVector is empty or not.
   bool empty() const {
@@ -146,6 +149,24 @@ public:
       return true;
     }
     return false;
+  }
+
+  /// Erase a single element from the set vector.
+  /// \returns an iterator pointing to the next element that followed the
+  /// element erased. This is the end of the SetVector if the last element is
+  /// erased.
+  iterator erase(iterator I) {
+    const key_type &V = *I;
+    assert(set_.count(V) && "Corrupted SetVector instances!");
+    set_.erase(V);
+
+    // FIXME: No need to use the non-const iterator when built with
+    // std:vector.erase(const_iterator) as defined in C++11. This is for
+    // compatibility with non-standard libstdc++ up to 4.8 (fixed in 4.9).
+    auto NI = vector_.begin();
+    std::advance(NI, std::distance<iterator>(NI, I));
+
+    return vector_.erase(NI);
   }
 
   /// \brief Remove items from the set vector based on a predicate function.

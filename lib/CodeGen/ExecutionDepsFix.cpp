@@ -168,6 +168,11 @@ public:
 
   bool runOnMachineFunction(MachineFunction &MF) override;
 
+  MachineFunctionProperties getRequiredProperties() const override {
+    return MachineFunctionProperties().set(
+        MachineFunctionProperties::Property::AllVRegsAllocated);
+  }
+
   const char *getPassName() const override {
     return "Execution dependency fix";
   }
@@ -375,8 +380,8 @@ void ExeDepsFix::enterBasicBlock(MachineBasicBlock *MBB) {
 
   // This is the entry block.
   if (MBB->pred_empty()) {
-    for (unsigned LI : MBB->liveins()) {
-      for (int rx : regIndices(LI)) {
+    for (const auto &LI : MBB->liveins()) {
+      for (int rx : regIndices(LI.PhysReg)) {
         // Treat function live-ins as if they were defined just before the first
         // instruction.  Usually, function arguments are set up immediately
         // before the call.
@@ -751,7 +756,7 @@ bool ExeDepsFix::runOnMachineFunction(MachineFunction &mf) {
         AliasMap[*AI].push_back(i);
   }
 
-  MachineBasicBlock *Entry = MF->begin();
+  MachineBasicBlock *Entry = &*MF->begin();
   ReversePostOrderTraversal<MachineBasicBlock*> RPOT(Entry);
   SmallVector<MachineBasicBlock*, 16> Loops;
   for (ReversePostOrderTraversal<MachineBasicBlock*>::rpo_iterator
@@ -760,22 +765,19 @@ bool ExeDepsFix::runOnMachineFunction(MachineFunction &mf) {
     enterBasicBlock(MBB);
     if (SeenUnknownBackEdge)
       Loops.push_back(MBB);
-    for (MachineBasicBlock::iterator I = MBB->begin(), E = MBB->end(); I != E;
-        ++I)
-      visitInstr(I);
+    for (MachineInstr &MI : *MBB)
+      visitInstr(&MI);
     processUndefReads(MBB);
     leaveBasicBlock(MBB);
   }
 
   // Visit all the loop blocks again in order to merge DomainValues from
   // back-edges.
-  for (unsigned i = 0, e = Loops.size(); i != e; ++i) {
-    MachineBasicBlock *MBB = Loops[i];
+  for (MachineBasicBlock *MBB : Loops) {
     enterBasicBlock(MBB);
-    for (MachineBasicBlock::iterator I = MBB->begin(), E = MBB->end(); I != E;
-        ++I)
-      if (!I->isDebugValue())
-        processDefs(I, false);
+    for (MachineInstr &MI : *MBB)
+      if (!MI.isDebugValue())
+        processDefs(&MI, false);
     processUndefReads(MBB);
     leaveBasicBlock(MBB);
   }

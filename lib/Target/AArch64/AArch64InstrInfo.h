@@ -87,20 +87,31 @@ public:
   /// unprofitable.
   bool isLdStPairSuppressed(const MachineInstr *MI) const;
 
+  /// Return true if this is an unscaled load/store.
+  bool isUnscaledLdSt(unsigned Opc) const;
+
+  /// Return true if this is an unscaled load/store.
+  bool isUnscaledLdSt(MachineInstr *MI) const;
+
+  /// Return true if this is a load/store that can be potentially paired/merged.
+  bool isCandidateToMergeOrPair(MachineInstr *MI) const;
+
   /// Hint that pairing the given load or store is unprofitable.
   void suppressLdStPair(MachineInstr *MI) const;
 
   bool getMemOpBaseRegImmOfs(MachineInstr *LdSt, unsigned &BaseReg,
-                             unsigned &Offset,
+                             int64_t &Offset,
                              const TargetRegisterInfo *TRI) const override;
 
   bool getMemOpBaseRegImmOfsWidth(MachineInstr *LdSt, unsigned &BaseReg,
-                                  int &Offset, int &Width,
+                                  int64_t &Offset, unsigned &Width,
                                   const TargetRegisterInfo *TRI) const;
 
   bool enableClusterLoads() const override { return true; }
 
-  bool shouldClusterLoads(MachineInstr *FirstLdSt, MachineInstr *SecondLdSt,
+  bool enableClusterStores() const override { return true; }
+
+  bool shouldClusterMemOps(MachineInstr *FirstLdSt, MachineInstr *SecondLdSt,
                           unsigned NumLoads) const override;
 
   bool shouldScheduleAdjacent(MachineInstr *First,
@@ -167,13 +178,15 @@ public:
   /// for an instruction chain ending in <Root>. All potential patterns are
   /// listed in the <Patterns> array.
   bool getMachineCombinerPatterns(MachineInstr &Root,
-                  SmallVectorImpl<MachineCombinerPattern::MC_PATTERN> &Patterns)
+                  SmallVectorImpl<MachineCombinerPattern> &Patterns)
       const override;
-
+  /// Return true when Inst is associative and commutative so that it can be
+  /// reassociated.
+  bool isAssociativeAndCommutative(const MachineInstr &Inst) const override;
   /// When getMachineCombinerPatterns() finds patterns, this function generates
   /// the instructions that could replace the original code sequence
   void genAlternativeCodeSequence(
-      MachineInstr &Root, MachineCombinerPattern::MC_PATTERN Pattern,
+      MachineInstr &Root, MachineCombinerPattern Pattern,
       SmallVectorImpl<MachineInstr *> &InsInstrs,
       SmallVectorImpl<MachineInstr *> &DelInstrs,
       DenseMap<unsigned, unsigned> &InstrIdxForVirtReg) const override;
@@ -193,6 +206,8 @@ private:
   void instantiateCondBranch(MachineBasicBlock &MBB, DebugLoc DL,
                              MachineBasicBlock *TBB,
                              ArrayRef<MachineOperand> Cond) const;
+  bool substituteCmpInstr(MachineInstr *CmpInstr,
+                          unsigned SrcReg, const MachineRegisterInfo *MRI) const;
 };
 
 /// emitFrameOffset - Emit instructions as needed to set DestReg to SrcReg

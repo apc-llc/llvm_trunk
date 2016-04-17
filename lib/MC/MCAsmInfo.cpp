@@ -75,6 +75,7 @@ MCAsmInfo::MCAsmInfo() {
   HasSingleParameterDotFile = true;
   HasIdentDirective = false;
   HasNoDeadStrip = false;
+  HasAltEntry = false;
   WeakDirective = "\t.weak\t";
   WeakRefDirective = nullptr;
   HasWeakDefDirective = false;
@@ -156,4 +157,10 @@ bool MCAsmInfo::isValidUnquotedName(StringRef Name) const {
   }
 
   return true;
+}
+
+bool MCAsmInfo::shouldOmitSectionDirective(StringRef SectionName) const {
+  // FIXME: Does .section .bss/.data/.text work everywhere??
+  return SectionName == ".text" || SectionName == ".data" ||
+        (SectionName == ".bss" && !usesELFSectionDirectiveForBSS());
 }

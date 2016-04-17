@@ -13,10 +13,12 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/Transforms/Scalar.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/Analysis/AliasAnalysis.h"
 #include "llvm/Analysis/AssumptionCache.h"
+#include "llvm/Analysis/GlobalsModRef.h"
 #include "llvm/Analysis/MemoryDependenceAnalysis.h"
 #include "llvm/Analysis/TargetLibraryInfo.h"
 #include "llvm/Analysis/ValueTracking.h"
@@ -164,8 +166,8 @@ bool MemsetRange::isProfitableToUseMemset(const DataLayout &DL) const {
 
   // If any of the stores are a memset, then it is always good to extend the
   // memset.
-  for (unsigned i = 0, e = TheStores.size(); i != e; ++i)
-    if (!isa<StoreInst>(TheStores[i]))
+  for (Instruction *SI : TheStores)
+    if (!isa<StoreInst>(SI))
       return true;
 
   // Assume that the code generator is capable of merging pairs of stores
@@ -189,7 +191,7 @@ bool MemsetRange::isProfitableToUseMemset(const DataLayout &DL) const {
   unsigned NumPointerStores = Bytes / MaxIntSize;
 
   // Assume the remaining bytes if any are done a byte at a time.
-  unsigned NumByteStores = Bytes - NumPointerStores * MaxIntSize;
+  unsigned NumByteStores = Bytes % MaxIntSize;
 
   // If we will reduce the # stores (according to this heuristic), do the
   // transformation.  This encourages merging 4 x i8 -> i32 and 2 x i16 -> i32
@@ -305,7 +307,7 @@ void MemsetRanges::addRange(int64_t Start, int64_t Size, Value *Ptr,
 
 namespace {
   class MemCpyOpt : public FunctionPass {
-    MemoryDependenceAnalysis *MD;
+    MemoryDependenceResults *MD;
     TargetLibraryInfo *TLI;
   public:
     static char ID; // Pass identification, replacement for typeid
@@ -323,11 +325,11 @@ namespace {
       AU.setPreservesCFG();
       AU.addRequired<AssumptionCacheTracker>();
       AU.addRequired<DominatorTreeWrapperPass>();
-      AU.addRequired<MemoryDependenceAnalysis>();
-      AU.addRequired<AliasAnalysis>();
+      AU.addRequired<MemoryDependenceWrapperPass>();
+      AU.addRequired<AAResultsWrapperPass>();
       AU.addRequired<TargetLibraryInfoWrapperPass>();
-      AU.addPreserved<AliasAnalysis>();
-      AU.addPreserved<MemoryDependenceAnalysis>();
+      AU.addPreserved<GlobalsAAWrapperPass>();
+      AU.addPreserved<MemoryDependenceWrapperPass>();
     }
 
     // Helper functions
@@ -357,9 +359,10 @@ INITIALIZE_PASS_BEGIN(MemCpyOpt, "memcpyopt", "MemCpy Optimization",
                       false, false)
 INITIALIZE_PASS_DEPENDENCY(AssumptionCacheTracker)
 INITIALIZE_PASS_DEPENDENCY(DominatorTreeWrapperPass)
-INITIALIZE_PASS_DEPENDENCY(MemoryDependenceAnalysis)
+INITIALIZE_PASS_DEPENDENCY(MemoryDependenceWrapperPass)
 INITIALIZE_PASS_DEPENDENCY(TargetLibraryInfoWrapperPass)
-INITIALIZE_AG_DEPENDENCY(AliasAnalysis)
+INITIALIZE_PASS_DEPENDENCY(AAResultsWrapperPass)
+INITIALIZE_PASS_DEPENDENCY(GlobalsAAWrapperPass)
 INITIALIZE_PASS_END(MemCpyOpt, "memcpyopt", "MemCpy Optimization",
                     false, false)
 
@@ -377,7 +380,7 @@ Instruction *MemCpyOpt::tryMergingIntoMemset(Instruction *StartInst,
   // are stored.
   MemsetRanges Ranges(DL);
 
-  BasicBlock::iterator BI = StartInst;
+  BasicBlock::iterator BI(StartInst);
   for (++BI; !isa<TerminatorInst>(BI); ++BI) {
     if (!isa<StoreInst>(BI) && !isa<MemSetInst>(BI)) {
       // If the instruction is readnone, ignore it, otherwise bail out.  We
@@ -432,14 +435,12 @@ Instruction *MemCpyOpt::tryMergingIntoMemset(Instruction *StartInst,
   // If we create any memsets, we put it right before the first instruction that
   // isn't part of the memset block.  This ensure that the memset is dominated
   // by any addressing instruction needed by the start of the block.
-  IRBuilder<> Builder(BI);
+  IRBuilder<> Builder(&*BI);
 
   // Now that we have full information about ranges, loop over the ranges and
   // emit memset's for anything big enough to be worthwhile.
   Instruction *AMemSet = nullptr;
-  for (MemsetRanges::const_iterator I = Ranges.begin(), E = Ranges.end();
-       I != E; ++I) {
-    const MemsetRange &Range = *I;
+  for (const MemsetRange &Range : Ranges) {
 
     if (Range.TheStores.size() == 1) continue;
 
@@ -463,19 +464,17 @@ Instruction *MemCpyOpt::tryMergingIntoMemset(Instruction *StartInst,
       Builder.CreateMemSet(StartPtr, ByteVal, Range.End-Range.Start, Alignment);
 
     DEBUG(dbgs() << "Replace stores:\n";
-          for (unsigned i = 0, e = Range.TheStores.size(); i != e; ++i)
-            dbgs() << *Range.TheStores[i] << '\n';
+          for (Instruction *SI : Range.TheStores)
+            dbgs() << *SI << '\n';
           dbgs() << "With: " << *AMemSet << '\n');
 
     if (!Range.TheStores.empty())
       AMemSet->setDebugLoc(Range.TheStores[0]->getDebugLoc());
 
     // Zap all the stores.
-    for (SmallVectorImpl<Instruction *>::const_iterator
-         SI = Range.TheStores.begin(),
-         SE = Range.TheStores.end(); SI != SE; ++SI) {
-      MD->removeInstruction(*SI);
-      (*SI)->eraseFromParent();
+    for (Instruction *SI : Range.TheStores) {
+      MD->removeInstruction(SI);
+      SI->eraseFromParent();
     }
     ++NumMemSetInfer;
   }
@@ -483,17 +482,191 @@ Instruction *MemCpyOpt::tryMergingIntoMemset(Instruction *StartInst,
   return AMemSet;
 }
 
+static unsigned findCommonAlignment(const DataLayout &DL, const StoreInst *SI,
+                                     const LoadInst *LI) {
+  unsigned StoreAlign = SI->getAlignment();
+  if (!StoreAlign)
+    StoreAlign = DL.getABITypeAlignment(SI->getOperand(0)->getType());
+  unsigned LoadAlign = LI->getAlignment();
+  if (!LoadAlign)
+    LoadAlign = DL.getABITypeAlignment(LI->getType());
+
+  return std::min(StoreAlign, LoadAlign);
+}
+
+// This method try to lift a store instruction before position P.
+// It will lift the store and its argument + that anything that
+// lay alias with these.
+// The method returns true if it was successful.
+static bool moveUp(AliasAnalysis &AA, StoreInst *SI, Instruction *P) {
+  // If the store alias this position, early bail out.
+  MemoryLocation StoreLoc = MemoryLocation::get(SI);
+  if (AA.getModRefInfo(P, StoreLoc) != MRI_NoModRef)
+    return false;
+
+  // Keep track of the arguments of all instruction we plan to lift
+  // so we can make sure to lift them as well if apropriate.
+  DenseSet<Instruction*> Args;
+  if (auto *Ptr = dyn_cast<Instruction>(SI->getPointerOperand()))
+    if (Ptr->getParent() == SI->getParent())
+      Args.insert(Ptr);
+
+  // Instruction to lift before P.
+  SmallVector<Instruction*, 8> ToLift;
+
+  // Memory locations of lifted instructions.
+  SmallVector<MemoryLocation, 8> MemLocs;
+  MemLocs.push_back(StoreLoc);
+
+  // Lifted callsites.
+  SmallVector<ImmutableCallSite, 8> CallSites;
+
+  for (auto I = --SI->getIterator(), E = P->getIterator(); I != E; --I) {
+    auto *C = &*I;
+
+    bool MayAlias = AA.getModRefInfo(C) != MRI_NoModRef;
+
+    bool NeedLift = false;
+    if (Args.erase(C))
+      NeedLift = true;
+    else if (MayAlias) {
+      NeedLift = std::any_of(MemLocs.begin(), MemLocs.end(),
+        [C, &AA](const MemoryLocation &ML) {
+          return AA.getModRefInfo(C, ML);
+        });
+
+      if (!NeedLift)
+        NeedLift = std::any_of(CallSites.begin(), CallSites.end(),
+          [C, &AA](const ImmutableCallSite &CS) {
+            return AA.getModRefInfo(C, CS);
+          });
+    }
+
+    if (!NeedLift)
+      continue;
+
+    if (MayAlias) {
+      if (auto CS = ImmutableCallSite(C)) {
+        // If we can't lift this before P, it's game over.
+        if (AA.getModRefInfo(P, CS) != MRI_NoModRef)
+          return false;
+
+        CallSites.push_back(CS);
+      } else if (isa<LoadInst>(C) || isa<StoreInst>(C) || isa<VAArgInst>(C)) {
+        // If we can't lift this before P, it's game over.
+        auto ML = MemoryLocation::get(C);
+        if (AA.getModRefInfo(P, ML) != MRI_NoModRef)
+          return false;
+
+        MemLocs.push_back(ML);
+      } else
+        // We don't know how to lift this instruction.
+        return false;
+    }
+
+    ToLift.push_back(C);
+    for (unsigned k = 0, e = C->getNumOperands(); k != e; ++k)
+      if (auto *A = dyn_cast<Instruction>(C->getOperand(k)))
+        if (A->getParent() == SI->getParent())
+          Args.insert(A);
+  }
+
+  // We made it, we need to lift
+  for (auto *I : reverse(ToLift)) {
+    DEBUG(dbgs() << "Lifting " << *I << " before " << *P << "\n");
+    I->moveBefore(P);
+  }
+
+  return true;
+}
 
 bool MemCpyOpt::processStore(StoreInst *SI, BasicBlock::iterator &BBI) {
   if (!SI->isSimple()) return false;
+
+  // Avoid merging nontemporal stores since the resulting
+  // memcpy/memset would not be able to preserve the nontemporal hint.
+  // In theory we could teach how to propagate the !nontemporal metadata to
+  // memset calls. However, that change would force the backend to
+  // conservatively expand !nontemporal memset calls back to sequences of
+  // store instructions (effectively undoing the merging).
+  if (SI->getMetadata(LLVMContext::MD_nontemporal))
+    return false;
+
   const DataLayout &DL = SI->getModule()->getDataLayout();
 
-  // Detect cases where we're performing call slot forwarding, but
-  // happen to be using a load-store pair to implement it, rather than
-  // a memcpy.
+  // Load to store forwarding can be interpreted as memcpy.
   if (LoadInst *LI = dyn_cast<LoadInst>(SI->getOperand(0))) {
     if (LI->isSimple() && LI->hasOneUse() &&
         LI->getParent() == SI->getParent()) {
+
+      auto *T = LI->getType();
+      if (T->isAggregateType()) {
+        AliasAnalysis &AA = getAnalysis<AAResultsWrapperPass>().getAAResults();
+        MemoryLocation LoadLoc = MemoryLocation::get(LI);
+
+        // We use alias analysis to check if an instruction may store to
+        // the memory we load from in between the load and the store. If
+        // such an instruction is found, we try to promote there instead
+        // of at the store position.
+        Instruction *P = SI;
+        for (auto &I : make_range(++LI->getIterator(), SI->getIterator())) {
+          if (AA.getModRefInfo(&I, LoadLoc) & MRI_Mod) {
+            P = &I;
+            break;
+          }
+        }
+
+        // We found an instruction that may write to the loaded memory.
+        // We can try to promote at this position instead of the store
+        // position if nothing alias the store memory after this and the store
+        // destination is not in the range.
+        if (P && P != SI) {
+          if (!moveUp(AA, SI, P))
+            P = nullptr;
+        }
+
+        // If a valid insertion position is found, then we can promote
+        // the load/store pair to a memcpy.
+        if (P) {
+          // If we load from memory that may alias the memory we store to,
+          // memmove must be used to preserve semantic. If not, memcpy can
+          // be used.
+          bool UseMemMove = false;
+          if (!AA.isNoAlias(MemoryLocation::get(SI), LoadLoc))
+            UseMemMove = true;
+
+          unsigned Align = findCommonAlignment(DL, SI, LI);
+          uint64_t Size = DL.getTypeStoreSize(T);
+
+          IRBuilder<> Builder(P);
+          Instruction *M;
+          if (UseMemMove)
+            M = Builder.CreateMemMove(SI->getPointerOperand(),
+                                      LI->getPointerOperand(), Size,
+                                      Align, SI->isVolatile());
+          else
+            M = Builder.CreateMemCpy(SI->getPointerOperand(),
+                                     LI->getPointerOperand(), Size,
+                                     Align, SI->isVolatile());
+
+          DEBUG(dbgs() << "Promoting " << *LI << " to " << *SI
+                       << " => " << *M << "\n");
+
+          MD->removeInstruction(SI);
+          SI->eraseFromParent();
+          MD->removeInstruction(LI);
+          LI->eraseFromParent();
+          ++NumMemCpyInstr;
+
+          // Make sure we do not invalidate the iterator.
+          BBI = M->getIterator();
+          return true;
+        }
+      }
+
+      // Detect cases where we're performing call slot forwarding, but
+      // happen to be using a load-store pair to implement it, rather than
+      // a memcpy.
       MemDepResult ldep = MD->getDependency(LI);
       CallInst *C = nullptr;
       if (ldep.isClobber() && !isa<MemCpyInst>(ldep.getInst()))
@@ -502,10 +675,10 @@ bool MemCpyOpt::processStore(StoreInst *SI, BasicBlock::iterator &BBI) {
       if (C) {
         // Check that nothing touches the dest of the "copy" between
         // the call and the store.
-        AliasAnalysis &AA = getAnalysis<AliasAnalysis>();
+        AliasAnalysis &AA = getAnalysis<AAResultsWrapperPass>().getAAResults();
         MemoryLocation StoreLoc = MemoryLocation::get(SI);
-        for (BasicBlock::iterator I = --BasicBlock::iterator(SI),
-                                  E = C; I != E; --I) {
+        for (BasicBlock::iterator I = --SI->getIterator(), E = C->getIterator();
+             I != E; --I) {
           if (AA.getModRefInfo(&*I, StoreLoc) != MRI_NoModRef) {
             C = nullptr;
             break;
@@ -514,18 +687,11 @@ bool MemCpyOpt::processStore(StoreInst *SI, BasicBlock::iterator &BBI) {
       }
 
       if (C) {
-        unsigned storeAlign = SI->getAlignment();
-        if (!storeAlign)
-          storeAlign = DL.getABITypeAlignment(SI->getOperand(0)->getType());
-        unsigned loadAlign = LI->getAlignment();
-        if (!loadAlign)
-          loadAlign = DL.getABITypeAlignment(LI->getType());
-
         bool changed = performCallSlotOptzn(
             LI, SI->getPointerOperand()->stripPointerCasts(),
             LI->getPointerOperand()->stripPointerCasts(),
             DL.getTypeStoreSize(SI->getOperand(0)->getType()),
-            std::min(storeAlign, loadAlign), C);
+            findCommonAlignment(DL, SI, LI), C);
         if (changed) {
           MD->removeInstruction(SI);
           SI->eraseFromParent();
@@ -544,12 +710,38 @@ bool MemCpyOpt::processStore(StoreInst *SI, BasicBlock::iterator &BBI) {
   // Ensure that the value being stored is something that can be memset'able a
   // byte at a time like "0" or "-1" or any width, as well as things like
   // 0xA0A0A0A0 and 0.0.
-  if (Value *ByteVal = isBytewiseValue(SI->getOperand(0)))
+  auto *V = SI->getOperand(0);
+  if (Value *ByteVal = isBytewiseValue(V)) {
     if (Instruction *I = tryMergingIntoMemset(SI, SI->getPointerOperand(),
                                               ByteVal)) {
-      BBI = I;  // Don't invalidate iterator.
+      BBI = I->getIterator(); // Don't invalidate iterator.
       return true;
     }
+
+    // If we have an aggregate, we try to promote it to memset regardless
+    // of opportunity for merging as it can expose optimization opportunities
+    // in subsequent passes.
+    auto *T = V->getType();
+    if (T->isAggregateType()) {
+      uint64_t Size = DL.getTypeStoreSize(T);
+      unsigned Align = SI->getAlignment();
+      if (!Align)
+        Align = DL.getABITypeAlignment(T);
+      IRBuilder<> Builder(SI);
+      auto *M = Builder.CreateMemSet(SI->getPointerOperand(), ByteVal,
+                                     Size, Align, SI->isVolatile());
+
+      DEBUG(dbgs() << "Promoting " << *SI << " to " << *M << "\n");
+
+      MD->removeInstruction(SI);
+      SI->eraseFromParent();
+      NumMemSetInfer++;
+
+      // Make sure we do not invalidate the iterator.
+      BBI = M->getIterator();
+      return true;
+    }
+  }
 
   return false;
 }
@@ -560,7 +752,7 @@ bool MemCpyOpt::processMemSet(MemSetInst *MSI, BasicBlock::iterator &BBI) {
   if (isa<ConstantInt>(MSI->getLength()) && !MSI->isVolatile())
     if (Instruction *I = tryMergingIntoMemset(MSI, MSI->getDest(),
                                               MSI->getValue())) {
-      BBI = I;  // Don't invalidate iterator.
+      BBI = I->getIterator(); // Don't invalidate iterator.
       return true;
     }
   return false;
@@ -703,7 +895,7 @@ bool MemCpyOpt::performCallSlotOptzn(Instruction *cpy,
   // unexpected manner, for example via a global, which we deduce from
   // the use analysis, we also need to know that it does not sneakily
   // access dest.  We rely on AA to figure this out for us.
-  AliasAnalysis &AA = getAnalysis<AliasAnalysis>();
+  AliasAnalysis &AA = getAnalysis<AAResultsWrapperPass>().getAAResults();
   ModRefInfo MR = AA.getModRefInfo(C, cpyDest, srcSize);
   // If necessary, perform additional analysis.
   if (MR != MRI_NoModRef)
@@ -742,11 +934,9 @@ bool MemCpyOpt::performCallSlotOptzn(Instruction *cpy,
   // Update AA metadata
   // FIXME: MD_tbaa_struct and MD_mem_parallel_loop_access should also be
   // handled here, but combineMetadata doesn't support them yet
-  unsigned KnownIDs[] = {
-    LLVMContext::MD_tbaa,
-    LLVMContext::MD_alias_scope,
-    LLVMContext::MD_noalias,
-  };
+  unsigned KnownIDs[] = {LLVMContext::MD_tbaa, LLVMContext::MD_alias_scope,
+                         LLVMContext::MD_noalias,
+                         LLVMContext::MD_invariant_group};
   combineMetadata(C, cpy, KnownIDs);
 
   // Remove the memcpy.
@@ -779,7 +969,7 @@ bool MemCpyOpt::processMemCpyMemCpyDependence(MemCpyInst *M, MemCpyInst *MDep) {
   if (!MDepLen || !MLen || MDepLen->getZExtValue() < MLen->getZExtValue())
     return false;
 
-  AliasAnalysis &AA = getAnalysis<AliasAnalysis>();
+  AliasAnalysis &AA = getAnalysis<AAResultsWrapperPass>().getAAResults();
 
   // Verify that the copied-from memory doesn't change in between the two
   // transfers.  For example, in:
@@ -793,8 +983,9 @@ bool MemCpyOpt::processMemCpyMemCpyDependence(MemCpyInst *M, MemCpyInst *MDep) {
   //
   // NOTE: This is conservative, it will stop on any read from the source loc,
   // not just the defining memcpy.
-  MemDepResult SourceDep = MD->getPointerDependencyFrom(
-      MemoryLocation::getForSource(MDep), false, M, M->getParent());
+  MemDepResult SourceDep =
+      MD->getPointerDependencyFrom(MemoryLocation::getForSource(MDep), false,
+                                   M->getIterator(), M->getParent());
   if (!SourceDep.isClobber() || SourceDep.getInst() != MDep)
     return false;
 
@@ -851,8 +1042,9 @@ bool MemCpyOpt::processMemSetMemCpyDependence(MemCpyInst *MemCpy,
     return false;
 
   // Check that there are no other dependencies on the memset destination.
-  MemDepResult DstDepInfo = MD->getPointerDependencyFrom(
-      MemoryLocation::getForDest(MemSet), false, MemCpy, MemCpy->getParent());
+  MemDepResult DstDepInfo =
+      MD->getPointerDependencyFrom(MemoryLocation::getForDest(MemSet), false,
+                                   MemCpy->getIterator(), MemCpy->getParent());
   if (DstDepInfo.getInst() != MemSet)
     return false;
 
@@ -989,8 +1181,8 @@ bool MemCpyOpt::processMemCpy(MemCpyInst *M) {
   }
 
   MemoryLocation SrcLoc = MemoryLocation::getForSource(M);
-  MemDepResult SrcDepInfo = MD->getPointerDependencyFrom(SrcLoc, true,
-                                                         M, M->getParent());
+  MemDepResult SrcDepInfo = MD->getPointerDependencyFrom(
+      SrcLoc, true, M->getIterator(), M->getParent());
 
   if (SrcDepInfo.isClobber()) {
     if (MemCpyInst *MDep = dyn_cast<MemCpyInst>(SrcDepInfo.getInst()))
@@ -1031,7 +1223,7 @@ bool MemCpyOpt::processMemCpy(MemCpyInst *M) {
 /// Transforms memmove calls to memcpy calls when the src/dst are guaranteed
 /// not to alias.
 bool MemCpyOpt::processMemMove(MemMoveInst *M) {
-  AliasAnalysis &AA = getAnalysis<AliasAnalysis>();
+  AliasAnalysis &AA = getAnalysis<AAResultsWrapperPass>().getAAResults();
 
   if (!TLI->has(LibFunc::memmove))
     return false;
@@ -1044,12 +1236,11 @@ bool MemCpyOpt::processMemMove(MemMoveInst *M) {
   DEBUG(dbgs() << "MemCpyOpt: Optimizing memmove -> memcpy: " << *M << "\n");
 
   // If not, then we know we can transform this.
-  Module *Mod = M->getParent()->getParent()->getParent();
   Type *ArgTys[3] = { M->getRawDest()->getType(),
                       M->getRawSource()->getType(),
                       M->getLength()->getType() };
-  M->setCalledFunction(Intrinsic::getDeclaration(Mod, Intrinsic::memcpy,
-                                                 ArgTys));
+  M->setCalledFunction(Intrinsic::getDeclaration(M->getModule(),
+                                                 Intrinsic::memcpy, ArgTys));
 
   // MemDep may have over conservative information about this instruction, just
   // conservatively flush it from the cache.
@@ -1067,8 +1258,8 @@ bool MemCpyOpt::processByValArgument(CallSite CS, unsigned ArgNo) {
   Type *ByValTy = cast<PointerType>(ByValArg->getType())->getElementType();
   uint64_t ByValSize = DL.getTypeAllocSize(ByValTy);
   MemDepResult DepInfo = MD->getPointerDependencyFrom(
-      MemoryLocation(ByValArg, ByValSize), true, CS.getInstruction(),
-      CS.getInstruction()->getParent());
+      MemoryLocation(ByValArg, ByValSize), true,
+      CS.getInstruction()->getIterator(), CS.getInstruction()->getParent());
   if (!DepInfo.isClobber())
     return false;
 
@@ -1110,9 +1301,9 @@ bool MemCpyOpt::processByValArgument(CallSite CS, unsigned ArgNo) {
   //
   // NOTE: This is conservative, it will stop on any read from the source loc,
   // not just the defining memcpy.
-  MemDepResult SourceDep =
-      MD->getPointerDependencyFrom(MemoryLocation::getForSource(MDep), false,
-                                   CS.getInstruction(), MDep->getParent());
+  MemDepResult SourceDep = MD->getPointerDependencyFrom(
+      MemoryLocation::getForSource(MDep), false,
+      CS.getInstruction()->getIterator(), MDep->getParent());
   if (!SourceDep.isClobber() || SourceDep.getInst() != MDep)
     return false;
 
@@ -1139,7 +1330,7 @@ bool MemCpyOpt::iterateOnFunction(Function &F) {
   for (Function::iterator BB = F.begin(), BBE = F.end(); BB != BBE; ++BB) {
     for (BasicBlock::iterator BI = BB->begin(), BE = BB->end(); BI != BE;) {
       // Avoid invalidating the iterator.
-      Instruction *I = BI++;
+      Instruction *I = &*BI++;
 
       bool RepeatInstruction = false;
 
@@ -1174,7 +1365,7 @@ bool MemCpyOpt::runOnFunction(Function &F) {
     return false;
 
   bool MadeChange = false;
-  MD = &getAnalysis<MemoryDependenceAnalysis>();
+  MD = &getAnalysis<MemoryDependenceWrapperPass>().getMemDep();
   TLI = &getAnalysis<TargetLibraryInfoWrapperPass>().getTLI();
 
   // If we don't have at least memset and memcpy, there is little point of doing

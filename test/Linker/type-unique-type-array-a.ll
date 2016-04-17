@@ -1,4 +1,4 @@
-; REQUIRES: object-emission, native
+; REQUIRES: default_triple, object-emission
 ;
 ; RUN: llvm-link %s %p/type-unique-type-array-b.ll -S -o - | %llc_dwarf -filetype=obj -O0 | llvm-dwarfdump -debug-dump=info - | FileCheck %s
 ;
@@ -43,7 +43,7 @@
 %struct.SA = type { i32 }
 
 ; Function Attrs: ssp uwtable
-define void @_Z4topAP1A2SA(%class.A* %a, i32 %sa.coerce) #0 {
+define void @_Z4topAP1A2SA(%class.A* %a, i32 %sa.coerce) #0 !dbg !15 {
 entry:
   %sa = alloca %struct.SA, align 4
   %a.addr = alloca %class.A*, align 8
@@ -67,7 +67,7 @@ entry:
 declare void @llvm.dbg.declare(metadata, metadata, metadata) #1
 
 ; Function Attrs: nounwind ssp uwtable
-define linkonce_odr void @_ZN1A5testAE2SA(%class.A* %this, i32 %a.coerce) #2 align 2 {
+define linkonce_odr void @_ZN1A5testAE2SA(%class.A* %this, i32 %a.coerce) #2 align 2 !dbg !20 {
 entry:
   %a = alloca %struct.SA, align 4
   %this.addr = alloca %class.A*, align 8
@@ -92,27 +92,26 @@ attributes #3 = { nounwind }
 !llvm.module.flags = !{!21, !22}
 !llvm.ident = !{!23}
 
-!0 = distinct !DICompileUnit(language: DW_LANG_C_plus_plus, producer: "clang version 3.5.0 (trunk 214102:214113M) (llvm/trunk 214102:214115M)", isOptimized: false, emissionKind: 1, file: !1, enums: !2, retainedTypes: !3, subprograms: !14, globals: !2, imports: !2)
+!0 = distinct !DICompileUnit(language: DW_LANG_C_plus_plus, producer: "clang version 3.5.0 (trunk 214102:214113M) (llvm/trunk 214102:214115M)", isOptimized: false, emissionKind: FullDebug, file: !1, enums: !2, retainedTypes: !3, globals: !2, imports: !2)
 !1 = !DIFile(filename: "a.cpp", directory: "/Users/manmanren/test-Nov/type_unique/rdar_di_array")
 !2 = !{}
 !3 = !{!4, !10}
-!4 = !DICompositeType(tag: DW_TAG_class_type, name: "A", line: 5, size: 8, align: 8, file: !1, elements: !5, identifier: "_ZTS1A")
+!4 = !DICompositeType(tag: DW_TAG_class_type, name: "A", line: 5, file: !1, elements: !5, identifier: "_ZTS1A")
 !5 = !{!6}
 !6 = !DISubprogram(name: "testA", linkageName: "_ZN1A5testAE2SA", line: 7, isLocal: false, isDefinition: false, virtualIndex: 6, flags: DIFlagPrototyped, isOptimized: false, scopeLine: 7, file: !1, scope: !"_ZTS1A", type: !7)
 !7 = !DISubroutineType(types: !8)
 !8 = !{null, !9, !"_ZTS2SA"}
-!9 = !DIDerivedType(tag: DW_TAG_pointer_type, size: 64, align: 64, flags: DIFlagArtificial | DIFlagObjectPointer, baseType: !"_ZTS1A")
+!9 = !DIDerivedType(tag: DW_TAG_pointer_type, flags: DIFlagArtificial | DIFlagObjectPointer, baseType: !"_ZTS1A")
 !10 = !DICompositeType(tag: DW_TAG_structure_type, name: "SA", line: 1, size: 32, align: 32, file: !1, elements: !11, identifier: "_ZTS2SA")
 !11 = !{!12}
 !12 = !DIDerivedType(tag: DW_TAG_member, name: "a", line: 2, size: 32, align: 32, file: !1, scope: !"_ZTS2SA", baseType: !13)
 !13 = !DIBasicType(tag: DW_TAG_base_type, name: "int", size: 32, align: 32, encoding: DW_ATE_signed)
-!14 = !{!15, !20}
-!15 = distinct !DISubprogram(name: "topA", linkageName: "_Z4topAP1A2SA", line: 11, isLocal: false, isDefinition: true, virtualIndex: 6, flags: DIFlagPrototyped, isOptimized: false, scopeLine: 11, file: !1, scope: !16, type: !17, function: void (%class.A*, i32)* @_Z4topAP1A2SA, variables: !2)
+!15 = distinct !DISubprogram(name: "topA", linkageName: "_Z4topAP1A2SA", line: 11, isLocal: false, isDefinition: true, virtualIndex: 6, flags: DIFlagPrototyped, isOptimized: false, unit: !0, scopeLine: 11, file: !1, scope: !16, type: !17, variables: !2)
 !16 = !DIFile(filename: "a.cpp", directory: "/Users/manmanren/test-Nov/type_unique/rdar_di_array")
 !17 = !DISubroutineType(types: !18)
 !18 = !{null, !19, !"_ZTS2SA"}
-!19 = !DIDerivedType(tag: DW_TAG_pointer_type, size: 64, align: 64, baseType: !"_ZTS1A")
-!20 = distinct !DISubprogram(name: "testA", linkageName: "_ZN1A5testAE2SA", line: 7, isLocal: false, isDefinition: true, virtualIndex: 6, flags: DIFlagPrototyped, isOptimized: false, scopeLine: 7, file: !1, scope: !"_ZTS1A", type: !7, function: void (%class.A*, i32)* @_ZN1A5testAE2SA, declaration: !6, variables: !2)
+!19 = !DIDerivedType(tag: DW_TAG_pointer_type, baseType: !"_ZTS1A")
+!20 = distinct !DISubprogram(name: "testA", linkageName: "_ZN1A5testAE2SA", line: 7, isLocal: false, isDefinition: true, virtualIndex: 6, flags: DIFlagPrototyped, isOptimized: false, unit: !0, scopeLine: 7, file: !1, scope: !"_ZTS1A", type: !7, declaration: !6, variables: !2)
 !21 = !{i32 2, !"Dwarf Version", i32 2}
 !22 = !{i32 2, !"Debug Info Version", i32 3}
 !23 = !{!"clang version 3.5.0 (trunk 214102:214113M) (llvm/trunk 214102:214115M)"}

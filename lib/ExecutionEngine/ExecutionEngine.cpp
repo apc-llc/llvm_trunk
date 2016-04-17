@@ -103,12 +103,10 @@ public:
   /// \brief Returns the address the GlobalVariable should be written into.  The
   /// GVMemoryBlock object prefixes that.
   static char *Create(const GlobalVariable *GV, const DataLayout& TD) {
-    Type *ElTy = GV->getType()->getElementType();
+    Type *ElTy = GV->getValueType();
     size_t GVSize = (size_t)TD.getTypeAllocSize(ElTy);
     void *RawMemory = ::operator new(
-      RoundUpToAlignment(sizeof(GVMemoryBlock),
-                         TD.getPreferredAlignment(GV))
-      + GVSize);
+        alignTo(sizeof(GVMemoryBlock), TD.getPreferredAlignment(GV)) + GVSize);
     new(RawMemory) GVMemoryBlock(GV);
     return static_cast<char*>(RawMemory) + sizeof(GVMemoryBlock);
   }
@@ -237,11 +235,10 @@ void ExecutionEngine::clearAllGlobalMappings() {
 void ExecutionEngine::clearGlobalMappingsFromModule(Module *M) {
   MutexGuard locked(lock);
 
-  for (Module::iterator FI = M->begin(), FE = M->end(); FI != FE; ++FI)
-    EEState.RemoveMapping(getMangledName(FI));
-  for (Module::global_iterator GI = M->global_begin(), GE = M->global_end();
-       GI != GE; ++GI)
-    EEState.RemoveMapping(getMangledName(GI));
+  for (Function &FI : *M)
+    EEState.RemoveMapping(getMangledName(&FI));
+  for (GlobalVariable &GI : M->globals())
+    EEState.RemoveMapping(getMangledName(&GI));
 }
 
 uint64_t ExecutionEngine::updateGlobalMapping(const GlobalValue *GV,
@@ -869,8 +866,7 @@ GenericValue ExecutionEngine::getConstantValue(const Constant *C) {
             GV.IntVal = apfLHS.bitcastToAPInt();
             break;
           case Instruction::FRem:
-            apfLHS.mod(APFloat(Sem, RHS.IntVal),
-                       APFloat::rmNearestTiesToEven);
+            apfLHS.mod(APFloat(Sem, RHS.IntVal));
             GV.IntVal = apfLHS.bitcastToAPInt();
             break;
           }
@@ -1357,7 +1353,7 @@ void ExecutionEngine::EmitGlobalVariable(const GlobalVariable *GV) {
   if (!GV->isThreadLocal())
     InitializeMemory(GV->getInitializer(), GA);
 
-  Type *ElTy = GV->getType()->getElementType();
+  Type *ElTy = GV->getValueType();
   size_t GVSize = (size_t)getDataLayout().getTypeAllocSize(ElTy);
   NumInitBytes += (unsigned)GVSize;
   ++NumGlobals;

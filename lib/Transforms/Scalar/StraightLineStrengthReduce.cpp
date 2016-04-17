@@ -270,7 +270,7 @@ static bool isGEPFoldable(GetElementPtrInst *GEP,
   }
 
   unsigned AddrSpace = GEP->getPointerAddressSpace();
-  return TTI->isLegalAddressingMode(GEP->getType()->getElementType(), BaseGV,
+  return TTI->isLegalAddressingMode(GEP->getResultElementType(), BaseGV,
                                     BaseOffset, HasBaseReg, Scale, AddrSpace);
 }
 
@@ -524,7 +524,7 @@ void StraightLineStrengthReduce::allocateCandidatesAndFindBasisForGEP(
       continue;
 
     const SCEV *OrigIndexExpr = IndexExprs[I - 1];
-    IndexExprs[I - 1] = SE->getConstant(OrigIndexExpr->getType(), 0);
+    IndexExprs[I - 1] = SE->getZero(OrigIndexExpr->getType());
 
     // The base of this candidate is GEP's base plus the offsets of all
     // indices except this current one.
@@ -566,8 +566,7 @@ Value *StraightLineStrengthReduce::emitBump(const Candidate &Basis,
   if (Basis.CandidateKind == Candidate::GEP) {
     APInt ElementSize(
         IndexOffset.getBitWidth(),
-        DL->getTypeAllocSize(
-            cast<GetElementPtrInst>(Basis.Ins)->getType()->getElementType()));
+        DL->getTypeAllocSize(cast<GetElementPtrInst>(Basis.Ins)->getResultElementType()));
     APInt Q, R;
     APInt::sdivrem(IndexOffset, ElementSize, Q, R);
     if (R.getSExtValue() == 0)

@@ -158,7 +158,7 @@ static bool InsertRootInitializers(Function &F, AllocaInst **Roots,
 
   // Search for initializers in the initial BB.
   SmallPtrSet<AllocaInst *, 16> InitedRoots;
-  for (; !CouldBecomeSafePoint(IP); ++IP)
+  for (; !CouldBecomeSafePoint(&*IP); ++IP)
     if (StoreInst *SI = dyn_cast<StoreInst>(IP))
       if (AllocaInst *AI =
               dyn_cast<AllocaInst>(SI->getOperand(1)->stripPointerCasts()))
@@ -170,8 +170,7 @@ static bool InsertRootInitializers(Function &F, AllocaInst **Roots,
   for (AllocaInst **I = Roots, **E = Roots + Count; I != E; ++I)
     if (!InitedRoots.count(*I)) {
       StoreInst *SI = new StoreInst(
-          ConstantPointerNull::get(cast<PointerType>(
-              cast<PointerType>((*I)->getType())->getElementType())),
+          ConstantPointerNull::get(cast<PointerType>((*I)->getAllocatedType())),
           *I);
       SI->insertAfter(*I);
       MadeChange = true;

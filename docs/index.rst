@@ -65,12 +65,12 @@ representation.
    :hidden:
 
    CMake
+   AdvancedBuilds
    HowToBuildOnARM
    HowToCrossCompileLLVM
    CommandGuide/index
    GettingStarted
    GettingStartedVS
-   BuildingLLVMWithAutotools
    FAQ
    Lexicon
    HowToAddABuilder
@@ -86,6 +86,7 @@ representation.
    GetElementPtr
    Frontend/PerformanceTips
    MCJITDesignAndImplementation
+   CompileCudaWithLLVM
 
 :doc:`GettingStarted`
    Discusses how to get up and running quickly with the LLVM infrastructure.
@@ -105,10 +106,6 @@ representation.
 :doc:`GettingStartedVS`
    An addendum to the main Getting Started guide for those using Visual Studio
    on Windows.
-
-:doc:`BuildingLLVMWithAutotools`
-   An addendum to the Getting Started guide with instructions for building LLVM
-   with the Autotools build system.
 
 :doc:`tutorial/index`
    Tutorials about using LLVM. Includes a tutorial about making a custom
@@ -371,6 +368,9 @@ For API clients and LLVM developers.
 :doc:`FaultMaps`
   LLVM support for folding control flow into faulting machine instructions.
 
+:doc:`CompileCudaWithLLVM`
+  LLVM support for CUDA.
+
 Development Process Documentation
 =================================
 
@@ -380,7 +380,6 @@ Information about LLVM's development process.
    :hidden:
 
    DeveloperPolicy
-   MakefileGuide
    Projects
    LLVMBuild
    HowToReleaseLLVM
@@ -400,9 +399,6 @@ Information about LLVM's development process.
 :doc:`LLVMBuild`
   Describes the LLVMBuild organization and files used by LLVM to specify
   component descriptions.
-
-:doc:`MakefileGuide`
-  Describes how the LLVM makefiles work and how to use them.
 
 :doc:`HowToReleaseLLVM`
   This is a guide to preparing LLVM releases. Most developers can ignore it.

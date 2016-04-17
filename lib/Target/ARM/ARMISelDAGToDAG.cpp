@@ -171,8 +171,6 @@ public:
   bool SelectThumbAddrModeSP(SDValue N, SDValue &Base, SDValue &OffImm);
 
   // Thumb 2 Addressing Modes:
-  bool SelectT2ShifterOperandReg(SDValue N,
-                                 SDValue &BaseReg, SDValue &Opc);
   bool SelectT2AddrModeImm12(SDValue N, SDValue &Base, SDValue &OffImm);
   bool SelectT2AddrModeImm8(SDValue N, SDValue &Base,
                             SDValue &OffImm);
@@ -254,6 +252,8 @@ private:
 
   SDNode *SelectConcatVector(SDNode *N);
 
+  SDNode *SelectSMLAWSMULW(SDNode *N);
+
   /// SelectInlineAsmMemoryOperand - Implement addressing mode selection for
   /// inline asm expressions.
   bool SelectInlineAsmMemoryOperand(const SDValue &Op, unsigned ConstraintID,
@@ -273,6 +273,22 @@ private:
   // Get the alignment operand for a NEON VLD or VST instruction.
   SDValue GetVLDSTAlign(SDValue Align, SDLoc dl, unsigned NumVecs,
                         bool is64BitVector);
+
+  /// Returns the number of instructions required to materialize the given
+  /// constant in a register, or 3 if a literal pool load is needed.
+  unsigned ConstantMaterializationCost(unsigned Val) const;
+
+  /// Checks if N is a multiplication by a constant where we can extract out a
+  /// power of two from the constant so that it can be used in a shift, but only
+  /// if it simplifies the materialization of the constant. Returns true if it
+  /// is, and assigns to PowerOfTwo the power of two that should be extracted
+  /// out and to NewMulConst the new constant to be multiplied by.
+  bool canExtractShiftFromMul(const SDValue &N, unsigned MaxShift,
+                              unsigned &PowerOfTwo, SDValue &NewMulConst) const;
+
+  /// Replace N with M in CurDAG, in a way that also ensures that M gets
+  /// selected when N would have been selected.
+  void replaceDAGValue(const SDValue &N, SDValue M);
 };
 }
 
@@ -329,7 +345,7 @@ void ARMDAGToDAGISel::PreprocessISelDAG() {
   bool isThumb2 = Subtarget->isThumb();
   for (SelectionDAG::allnodes_iterator I = CurDAG->allnodes_begin(),
        E = CurDAG->allnodes_end(); I != E; ) {
-    SDNode *N = I++;  // Preincrement iterator to avoid invalidation issues.
+    SDNode *N = &*I++; // Preincrement iterator to avoid invalidation issues.
 
     if (N->getOpcode() != ISD::ADD)
       continue;
@@ -383,7 +399,7 @@ void ARMDAGToDAGISel::PreprocessISelDAG() {
     SDValue CPTmp1;
     SDValue CPTmp2;
     if (isThumb2) {
-      if (SelectT2ShifterOperandReg(N0, CPTmp0, CPTmp1))
+      if (SelectImmShifterOperand(N0, CPTmp0, CPTmp1))
         continue;
     } else {
       if (SelectImmShifterOperand(N0, CPTmp0, CPTmp1) ||
@@ -466,12 +482,85 @@ bool ARMDAGToDAGISel::isShifterOpProfitable(const SDValue &Shift,
          (ShAmt == 2 || (Subtarget->isSwift() && ShAmt == 1));
 }
 
+unsigned ARMDAGToDAGISel::ConstantMaterializationCost(unsigned Val) const {
+  if (Subtarget->isThumb()) {
+    if (Val <= 255) return 1;                               // MOV
+    if (Subtarget->hasV6T2Ops() && Val <= 0xffff) return 1; // MOVW
+    if (~Val <= 255) return 2;                              // MOV + MVN
+    if (ARM_AM::isThumbImmShiftedVal(Val)) return 2;        // MOV + LSL
+  } else {
+    if (ARM_AM::getSOImmVal(Val) != -1) return 1;           // MOV
+    if (ARM_AM::getSOImmVal(~Val) != -1) return 1;          // MVN
+    if (Subtarget->hasV6T2Ops() && Val <= 0xffff) return 1; // MOVW
+    if (ARM_AM::isSOImmTwoPartVal(Val)) return 2;           // two instrs
+  }
+  if (Subtarget->useMovt(*MF)) return 2; // MOVW + MOVT
+  return 3; // Literal pool load
+}
+
+bool ARMDAGToDAGISel::canExtractShiftFromMul(const SDValue &N,
+                                             unsigned MaxShift,
+                                             unsigned &PowerOfTwo,
+                                             SDValue &NewMulConst) const {
+  assert(N.getOpcode() == ISD::MUL);
+  assert(MaxShift > 0);
+
+  // If the multiply is used in more than one place then changing the constant
+  // will make other uses incorrect, so don't.
+  if (!N.hasOneUse()) return false;
+  // Check if the multiply is by a constant
+  ConstantSDNode *MulConst = dyn_cast<ConstantSDNode>(N.getOperand(1));
+  if (!MulConst) return false;
+  // If the constant is used in more than one place then modifying it will mean
+  // we need to materialize two constants instead of one, which is a bad idea.
+  if (!MulConst->hasOneUse()) return false;
+  unsigned MulConstVal = MulConst->getZExtValue();
+  if (MulConstVal == 0) return false;
+
+  // Find the largest power of 2 that MulConstVal is a multiple of
+  PowerOfTwo = MaxShift;
+  while ((MulConstVal % (1 << PowerOfTwo)) != 0) {
+    --PowerOfTwo;
+    if (PowerOfTwo == 0) return false;
+  }
+
+  // Only optimise if the new cost is better
+  unsigned NewMulConstVal = MulConstVal / (1 << PowerOfTwo);
+  NewMulConst = CurDAG->getConstant(NewMulConstVal, SDLoc(N), MVT::i32);
+  unsigned OldCost = ConstantMaterializationCost(MulConstVal);
+  unsigned NewCost = ConstantMaterializationCost(NewMulConstVal);
+  return NewCost < OldCost;
+}
+
+void ARMDAGToDAGISel::replaceDAGValue(const SDValue &N, SDValue M) {
+  CurDAG->RepositionNode(N.getNode()->getIterator(), M.getNode());
+  CurDAG->ReplaceAllUsesWith(N, M);
+}
+
 bool ARMDAGToDAGISel::SelectImmShifterOperand(SDValue N,
                                               SDValue &BaseReg,
                                               SDValue &Opc,
                                               bool CheckProfitability) {
   if (DisableShifterOp)
     return false;
+
+  // If N is a multiply-by-constant and it's profitable to extract a shift and
+  // use it in a shifted operand do so.
+  if (N.getOpcode() == ISD::MUL) {
+    unsigned PowerOfTwo = 0;
+    SDValue NewMulConst;
+    if (canExtractShiftFromMul(N, 31, PowerOfTwo, NewMulConst)) {
+      BaseReg = SDValue(Select(CurDAG->getNode(ISD::MUL, SDLoc(N), MVT::i32,
+                                               N.getOperand(0), NewMulConst)
+                                   .getNode()),
+                        0);
+      replaceDAGValue(N.getOperand(1), NewMulConst);
+      Opc = CurDAG->getTargetConstant(ARM_AM::getSORegOpc(ARM_AM::lsl,
+                                                          PowerOfTwo),
+                                      SDLoc(N), MVT::i32);
+      return true;
+    }
+  }
 
   ARM_AM::ShiftOpc ShOpcVal = ARM_AM::getShiftOpcForNode(N.getOpcode());
 
@@ -535,7 +624,9 @@ bool ARMDAGToDAGISel::SelectAddrModeImm12(SDValue N,
     }
 
     if (N.getOpcode() == ARMISD::Wrapper &&
-        N.getOperand(0).getOpcode() != ISD::TargetGlobalAddress) {
+        N.getOperand(0).getOpcode() != ISD::TargetGlobalAddress &&
+        N.getOperand(0).getOpcode() != ISD::TargetExternalSymbol &&
+        N.getOperand(0).getOpcode() != ISD::TargetGlobalTLSAddress) {
       Base = N.getOperand(0);
     } else
       Base = N;
@@ -657,6 +748,18 @@ bool ARMDAGToDAGISel::SelectLdStSOReg(SDValue N, SDValue &Base, SDValue &Offset,
     }
   }
 
+  // If Offset is a multiply-by-constant and it's profitable to extract a shift
+  // and use it in a shifted operand do so.
+  if (Offset.getOpcode() == ISD::MUL && N.hasOneUse()) {
+    unsigned PowerOfTwo = 0;
+    SDValue NewMulConst;
+    if (canExtractShiftFromMul(Offset, 31, PowerOfTwo, NewMulConst)) {
+      replaceDAGValue(Offset.getOperand(1), NewMulConst);
+      ShAmt = PowerOfTwo;
+      ShOpcVal = ARM_AM::lsl;
+    }
+  }
+
   Opc = CurDAG->getTargetConstant(ARM_AM::getAM2Opc(AddSub, ShAmt, ShOpcVal),
                                   SDLoc(N), MVT::i32);
   return true;
@@ -702,7 +805,9 @@ AddrMode2Type ARMDAGToDAGISel::SelectAddrMode2Worker(SDValue N,
       Base = CurDAG->getTargetFrameIndex(
           FI, TLI->getPointerTy(CurDAG->getDataLayout()));
     } else if (N.getOpcode() == ARMISD::Wrapper &&
-               N.getOperand(0).getOpcode() != ISD::TargetGlobalAddress) {
+               N.getOperand(0).getOpcode() != ISD::TargetGlobalAddress &&
+               N.getOperand(0).getOpcode() != ISD::TargetExternalSymbol &&
+               N.getOperand(0).getOpcode() != ISD::TargetGlobalTLSAddress) {
       Base = N.getOperand(0);
     }
     Offset = CurDAG->getRegister(0, MVT::i32);
@@ -968,7 +1073,9 @@ bool ARMDAGToDAGISel::SelectAddrMode5(SDValue N,
       Base = CurDAG->getTargetFrameIndex(
           FI, TLI->getPointerTy(CurDAG->getDataLayout()));
     } else if (N.getOpcode() == ARMISD::Wrapper &&
-               N.getOperand(0).getOpcode() != ISD::TargetGlobalAddress) {
+               N.getOperand(0).getOpcode() != ISD::TargetGlobalAddress &&
+               N.getOperand(0).getOpcode() != ISD::TargetExternalSymbol &&
+               N.getOperand(0).getOpcode() != ISD::TargetGlobalTLSAddress) {
       Base = N.getOperand(0);
     }
     Offset = CurDAG->getTargetConstant(ARM_AM::getAM5Opc(ARM_AM::add, 0),
@@ -1087,7 +1194,9 @@ ARMDAGToDAGISel::SelectThumbAddrModeImm5S(SDValue N, unsigned Scale,
     if (N.getOpcode() == ISD::ADD) {
       return false; // We want to select register offset instead
     } else if (N.getOpcode() == ARMISD::Wrapper &&
-               N.getOperand(0).getOpcode() != ISD::TargetGlobalAddress) {
+        N.getOperand(0).getOpcode() != ISD::TargetGlobalAddress &&
+        N.getOperand(0).getOpcode() != ISD::TargetExternalSymbol &&
+        N.getOperand(0).getOpcode() != ISD::TargetGlobalTLSAddress) {
       Base = N.getOperand(0);
     } else {
       Base = N;
@@ -1176,28 +1285,6 @@ bool ARMDAGToDAGISel::SelectThumbAddrModeSP(SDValue N,
 //===----------------------------------------------------------------------===//
 
 
-bool ARMDAGToDAGISel::SelectT2ShifterOperandReg(SDValue N, SDValue &BaseReg,
-                                                SDValue &Opc) {
-  if (DisableShifterOp)
-    return false;
-
-  ARM_AM::ShiftOpc ShOpcVal = ARM_AM::getShiftOpcForNode(N.getOpcode());
-
-  // Don't match base register only case. That is matched to a separate
-  // lower complexity pattern with explicit register operand.
-  if (ShOpcVal == ARM_AM::no_shift) return false;
-
-  BaseReg = N.getOperand(0);
-  unsigned ShImmVal = 0;
-  if (ConstantSDNode *RHS = dyn_cast<ConstantSDNode>(N.getOperand(1))) {
-    ShImmVal = RHS->getZExtValue() & 31;
-    Opc = getI32Imm(ARM_AM::getSORegOpc(ShOpcVal, ShImmVal), SDLoc(N));
-    return true;
-  }
-
-  return false;
-}
-
 bool ARMDAGToDAGISel::SelectT2AddrModeImm12(SDValue N,
                                             SDValue &Base, SDValue &OffImm) {
   // Match simple R + imm12 operands.
@@ -1215,7 +1302,9 @@ bool ARMDAGToDAGISel::SelectT2AddrModeImm12(SDValue N,
     }
 
     if (N.getOpcode() == ARMISD::Wrapper &&
-        N.getOperand(0).getOpcode() != ISD::TargetGlobalAddress) {
+        N.getOperand(0).getOpcode() != ISD::TargetGlobalAddress &&
+        N.getOperand(0).getOpcode() != ISD::TargetExternalSymbol &&
+        N.getOperand(0).getOpcode() != ISD::TargetGlobalTLSAddress) {
       Base = N.getOperand(0);
       if (Base.getOpcode() == ISD::TargetConstantPool)
         return false;  // We want to select t2LDRpci instead.
@@ -1335,6 +1424,17 @@ bool ARMDAGToDAGISel::SelectT2AddrModeSoReg(SDValue N,
       else {
         ShAmt = 0;
       }
+    }
+  }
+
+  // If OffReg is a multiply-by-constant and it's profitable to extract a shift
+  // and use it in a shifted operand do so.
+  if (OffReg.getOpcode() == ISD::MUL && N.hasOneUse()) {
+    unsigned PowerOfTwo = 0;
+    SDValue NewMulConst;
+    if (canExtractShiftFromMul(OffReg, 3, PowerOfTwo, NewMulConst)) {
+      replaceDAGValue(OffReg.getOperand(1), NewMulConst);
+      ShAmt = PowerOfTwo;
     }
   }
 
@@ -2369,6 +2469,135 @@ SDNode *ARMDAGToDAGISel::SelectABSOp(SDNode *N){
   return nullptr;
 }
 
+static bool SearchSignedMulShort(SDValue SignExt, unsigned *Opc, SDValue &Src1,
+                                 bool Accumulate) {
+  // For SM*WB, we need to some form of sext.
+  // For SM*WT, we need to search for (sra X, 16)
+  // Src1 then gets set to X.
+  if ((SignExt.getOpcode() == ISD::SIGN_EXTEND ||
+       SignExt.getOpcode() == ISD::SIGN_EXTEND_INREG ||
+       SignExt.getOpcode() == ISD::AssertSext) &&
+       SignExt.getValueType() == MVT::i32) {
+
+    *Opc = Accumulate ? ARM::SMLAWB : ARM::SMULWB;
+    Src1 = SignExt.getOperand(0);
+    return true;
+  }
+
+  if (SignExt.getOpcode() != ISD::SRA)
+    return false;
+
+  ConstantSDNode *SRASrc1 = dyn_cast<ConstantSDNode>(SignExt.getOperand(1));
+  if (!SRASrc1 || SRASrc1->getZExtValue() != 16)
+    return false;
+
+  SDValue Op0 = SignExt.getOperand(0);
+
+  // The sign extend operand for SM*WB could be generated by a shl and ashr.
+  if (Op0.getOpcode() == ISD::SHL) {
+    SDValue SHL = Op0;
+    ConstantSDNode *SHLSrc1 = dyn_cast<ConstantSDNode>(SHL.getOperand(1));
+    if (!SHLSrc1 || SHLSrc1->getZExtValue() != 16)
+      return false;
+
+    *Opc = Accumulate ? ARM::SMLAWB : ARM::SMULWB;
+    Src1 = Op0.getOperand(0);
+    return true;
+  }
+  *Opc = Accumulate ? ARM::SMLAWT : ARM::SMULWT;
+  Src1 = SignExt.getOperand(0);
+  return true;
+}
+
+static bool SearchSignedMulLong(SDValue OR, unsigned *Opc, SDValue &Src0,
+                                SDValue &Src1, bool Accumulate) {
+  // First we look for:
+  // (add (or (srl ?, 16), (shl ?, 16)))
+  if (OR.getOpcode() != ISD::OR)
+    return false;
+
+  SDValue SRL = OR.getOperand(0);
+  SDValue SHL = OR.getOperand(1);
+
+  if (SRL.getOpcode() != ISD::SRL || SHL.getOpcode() != ISD::SHL) {
+    SRL = OR.getOperand(1);
+    SHL = OR.getOperand(0);
+    if (SRL.getOpcode() != ISD::SRL || SHL.getOpcode() != ISD::SHL)
+      return false;
+  }
+
+  ConstantSDNode *SRLSrc1 = dyn_cast<ConstantSDNode>(SRL.getOperand(1));
+  ConstantSDNode *SHLSrc1 = dyn_cast<ConstantSDNode>(SHL.getOperand(1));
+  if (!SRLSrc1 || !SHLSrc1 || SRLSrc1->getZExtValue() != 16 ||
+      SHLSrc1->getZExtValue() != 16)
+    return false;
+
+  // The first operands to the shifts need to be the two results from the
+  // same smul_lohi node.
+  if ((SRL.getOperand(0).getNode() != SHL.getOperand(0).getNode()) ||
+       SRL.getOperand(0).getOpcode() != ISD::SMUL_LOHI)
+    return false;
+
+  SDNode *SMULLOHI = SRL.getOperand(0).getNode();
+  if (SRL.getOperand(0) != SDValue(SMULLOHI, 0) ||
+      SHL.getOperand(0) != SDValue(SMULLOHI, 1))
+    return false;
+
+  // Now we have:
+  // (add (or (srl (smul_lohi ?, ?), 16), (shl (smul_lohi ?, ?), 16)))
+  // For SMLAW[B|T] smul_lohi will take a 32-bit and a 16-bit arguments.
+  // For SMLAWB the 16-bit value will signed extended somehow.
+  // For SMLAWT only the SRA is required.
+
+  // Check both sides of SMUL_LOHI
+  if (SearchSignedMulShort(SMULLOHI->getOperand(0), Opc, Src1, Accumulate)) {
+    Src0 = SMULLOHI->getOperand(1);
+  } else if (SearchSignedMulShort(SMULLOHI->getOperand(1), Opc, Src1,
+                                  Accumulate)) {
+    Src0 = SMULLOHI->getOperand(0);
+  } else {
+    return false;
+  }
+  return true;
+}
+
+SDNode *ARMDAGToDAGISel::SelectSMLAWSMULW(SDNode *N) {
+  SDLoc dl(N);
+  SDValue Src0 = N->getOperand(0);
+  SDValue Src1 = N->getOperand(1);
+  SDValue A, B;
+  unsigned Opc = 0;
+
+  if (N->getOpcode() == ISD::ADD) {
+    if (Src0.getOpcode() != ISD::OR && Src1.getOpcode() != ISD::OR)
+      return nullptr;
+
+    SDValue Acc;
+    if (SearchSignedMulLong(Src0, &Opc, A, B, true)) {
+      Acc = Src1;
+    } else if (SearchSignedMulLong(Src1, &Opc, A, B, true)) {
+      Acc = Src0;
+    } else {
+      return nullptr;
+    }
+    if (Opc == 0)
+      return nullptr;
+
+    SDValue Ops[] = { A, B, Acc, getAL(CurDAG, dl),
+                      CurDAG->getRegister(0, MVT::i32) };
+    return CurDAG->SelectNodeTo(N, Opc, MVT::i32, MVT::Other, Ops);
+  } else if (N->getOpcode() == ISD::OR &&
+             SearchSignedMulLong(SDValue(N, 0), &Opc, A, B, false)) {
+    if (Opc == 0)
+      return nullptr;
+
+    SDValue Ops[] = { A, B, getAL(CurDAG, dl),
+                      CurDAG->getRegister(0, MVT::i32)};
+    return CurDAG->SelectNodeTo(N, Opc, MVT::i32, Ops);
+  }
+  return nullptr;
+}
+
 SDNode *ARMDAGToDAGISel::SelectConcatVector(SDNode *N) {
   // The only time a CONCAT_VECTORS operation can have legal types is when
   // two 64-bit vectors are concatenated to a 128-bit vector.
@@ -2388,6 +2617,13 @@ SDNode *ARMDAGToDAGISel::Select(SDNode *N) {
 
   switch (N->getOpcode()) {
   default: break;
+  case ISD::ADD:
+  case ISD::OR: {
+    SDNode *ResNode = SelectSMLAWSMULW(N);
+    if (ResNode)
+      return ResNode;
+    break;
+  }
   case ISD::WRITE_REGISTER: {
     SDNode *ResNode = SelectWriteRegister(N);
     if (ResNode)
@@ -2416,25 +2652,8 @@ SDNode *ARMDAGToDAGISel::Select(SDNode *N) {
   }
   case ISD::Constant: {
     unsigned Val = cast<ConstantSDNode>(N)->getZExtValue();
-    bool UseCP = true;
-    if (Subtarget->useMovt(*MF))
-      // Thumb2-aware targets have the MOVT instruction, so all immediates can
-      // be done with MOV + MOVT, at worst.
-      UseCP = false;
-    else {
-      if (Subtarget->isThumb()) {
-        UseCP = (Val > 255 &&                                  // MOV
-                 ~Val > 255 &&                                 // MOV + MVN
-                 !ARM_AM::isThumbImmShiftedVal(Val) &&         // MOV + LSL
-                 !(Subtarget->hasV6T2Ops() && Val <= 0xffff)); // MOVW
-      } else
-        UseCP = (ARM_AM::getSOImmVal(Val) == -1 &&             // MOV
-                 ARM_AM::getSOImmVal(~Val) == -1 &&            // MVN
-                 !ARM_AM::isSOImmTwoPartVal(Val) &&            // two instrs.
-                 !(Subtarget->hasV6T2Ops() && Val <= 0xffff)); // MOVW
-    }
-
-    if (UseCP) {
+    // If we can't materialize the constant we need to use a literal pool
+    if (ConstantMaterializationCost(Val) > 2) {
       SDValue CPIdx = CurDAG->getTargetConstantPool(
           ConstantInt::get(Type::getInt32Ty(*CurDAG->getContext()), Val),
           TLI->getPointerTy(CurDAG->getDataLayout()));
@@ -2980,7 +3199,7 @@ SDNode *ARMDAGToDAGISel::Select(SDNode *N) {
       SDLoc dl(N);
       SDValue Chain = N->getOperand(0);
       SDValue MemAddr = N->getOperand(2);
-      bool isThumb = Subtarget->isThumb() && Subtarget->hasThumb2();
+      bool isThumb = Subtarget->isThumb() && Subtarget->hasV8MBaselineOps();
 
       bool IsAcquire = IntNo == Intrinsic::arm_ldaexd;
       unsigned NewOpc = isThumb ? (IsAcquire ? ARM::t2LDAEXD : ARM::t2LDREXD)
@@ -3289,7 +3508,7 @@ static void getIntOperandsFromRegisterString(StringRef RegString,
                                              SelectionDAG *CurDAG, SDLoc DL,
                                              std::vector<SDValue>& Ops) {
   SmallVector<StringRef, 5> Fields;
-  RegString.split(Fields, ":");
+  RegString.split(Fields, ':');
 
   if (Fields.size() > 1) {
     bool AllIntFields = true;
@@ -3368,15 +3587,18 @@ static inline int getMClassRegisterSYSmValueMask(StringRef RegString) {
           .Case("basepri_max", 0x12)
           .Case("faultmask", 0x13)
           .Case("control", 0x14)
+          .Case("msplim", 0x0a)
+          .Case("psplim", 0x0b)
+          .Case("sp", 0x18)
           .Default(-1);
 }
 
 // The flags here are common to those allowed for apsr in the A class cores and
 // those allowed for the special registers in the M class cores. Returns a
 // value representing which flags were present, -1 if invalid.
-static inline int getMClassFlagsMask(StringRef Flags, bool hasThumb2DSP) {
+static inline int getMClassFlagsMask(StringRef Flags, bool hasDSP) {
   if (Flags.empty())
-    return 0x2 | (int)hasThumb2DSP;
+    return 0x2 | (int)hasDSP;
 
   return StringSwitch<int>(Flags)
           .Case("g", 0x1)
@@ -3397,15 +3619,31 @@ static int getMClassRegisterMask(StringRef Reg, StringRef Flags, bool IsRead,
   if (!Subtarget->hasV7Ops() && SYSmvalue >= 0x11 && SYSmvalue <= 0x13)
     return -1;
 
+  if (Subtarget->has8MSecExt() && Flags.lower() == "ns") {
+    Flags = "";
+    SYSmvalue |= 0x80;
+  }
+
+  if (!Subtarget->has8MSecExt() &&
+      (SYSmvalue == 0xa || SYSmvalue == 0xb || SYSmvalue > 0x14))
+    return -1;
+
+  if (!Subtarget->hasV8MMainlineOps() &&
+      (SYSmvalue == 0x8a || SYSmvalue == 0x8b || SYSmvalue == 0x91 ||
+       SYSmvalue == 0x93))
+    return -1;
+
   // If it was a read then we won't be expecting flags and so at this point
   // we can return the mask.
   if (IsRead) {
-    assert (Flags.empty() && "Unexpected flags for reading M class register.");
-    return SYSmvalue;
+    if (Flags.empty())
+      return SYSmvalue;
+    else
+      return -1;
   }
 
   // We know we are now handling a write so need to get the mask for the flags.
-  int Mask = getMClassFlagsMask(Flags, Subtarget->hasThumb2DSP());
+  int Mask = getMClassFlagsMask(Flags, Subtarget->hasDSP());
 
   // Only apsr, iapsr, eapsr, xpsr can have flags. The other register values
   // shouldn't have flags present.
@@ -3414,7 +3652,7 @@ static int getMClassRegisterMask(StringRef Reg, StringRef Flags, bool IsRead,
 
   // The _g and _nzcvqg versions are only valid if the DSP extension is
   // available.
-  if (!Subtarget->hasThumb2DSP() && (Mask & 0x1))
+  if (!Subtarget->hasDSP() && (Mask & 0x1))
     return -1;
 
   // The register was valid so need to put the mask in the correct place
@@ -3560,7 +3798,13 @@ SDNode *ARMDAGToDAGISel::SelectReadRegister(SDNode *N){
   // is an acceptable value, so check that a mask can be constructed from the
   // string.
   if (Subtarget->isMClass()) {
-    int SYSmValue = getMClassRegisterMask(SpecialReg, "", true, Subtarget);
+    StringRef Flags = "", Reg = SpecialReg;
+    if (Reg.endswith("_ns")) {
+      Flags = "ns";
+      Reg = Reg.drop_back(3);
+    }
+
+    int SYSmValue = getMClassRegisterMask(Reg, Flags, true, Subtarget);
     if (SYSmValue == -1)
       return nullptr;
 
@@ -3654,10 +3898,10 @@ SDNode *ARMDAGToDAGISel::SelectWriteRegister(SDNode *N){
     return CurDAG->getMachineNode(Opcode, DL, MVT::Other, Ops);
   }
 
-  SmallVector<StringRef, 5> Fields;
-  StringRef(SpecialReg).split(Fields, "_", 1, false);
-  std::string Reg = Fields[0].str();
-  StringRef Flags = Fields.size() == 2 ? Fields[1] : "";
+  std::pair<StringRef, StringRef> Fields;
+  Fields = StringRef(SpecialReg).rsplit('_');
+  std::string Reg = Fields.first.str();
+  StringRef Flags = Fields.second;
 
   // If the target was M Class then need to validate the special register value
   // and retrieve the mask for use in the instruction node.
@@ -3856,6 +4100,7 @@ SelectInlineAsmMemoryOperand(const SDValue &Op, unsigned ConstraintID,
     //        be an immediate and not a memory constraint.
     // Fallthrough.
   case InlineAsm::Constraint_m:
+  case InlineAsm::Constraint_o:
   case InlineAsm::Constraint_Q:
   case InlineAsm::Constraint_Um:
   case InlineAsm::Constraint_Un:

@@ -578,7 +578,7 @@ unsigned ARMFastISel::ARMMaterializeInt(const Constant *C, MVT VT) {
 
 unsigned ARMFastISel::ARMMaterializeGV(const GlobalValue *GV, MVT VT) {
   // For now 32-bit only.
-  if (VT != MVT::i32) return 0;
+  if (VT != MVT::i32 || GV->isThreadLocal()) return 0;
 
   Reloc::Model RelocM = TM.getRelocationModel();
   bool IsIndirect = Subtarget->GVIsIndirectSymbol(GV, RelocM);
@@ -1062,6 +1062,21 @@ bool ARMFastISel::SelectLoad(const Instruction *I) {
   if (cast<LoadInst>(I)->isAtomic())
     return false;
 
+  const Value *SV = I->getOperand(0);
+  if (TLI.supportSwiftError()) {
+    // Swifterror values can come from either a function parameter with
+    // swifterror attribute or an alloca with swifterror attribute.
+    if (const Argument *Arg = dyn_cast<Argument>(SV)) {
+      if (Arg->hasSwiftErrorAttr())
+        return false;
+    }
+
+    if (const AllocaInst *Alloca = dyn_cast<AllocaInst>(SV)) {
+      if (Alloca->isSwiftError())
+        return false;
+    }
+  }
+
   // Verify we have a legal type before going any further.
   MVT VT;
   if (!isLoadTypeLegal(I->getType(), VT))
@@ -1176,6 +1191,21 @@ bool ARMFastISel::SelectStore(const Instruction *I) {
   // Atomic stores need special handling.
   if (cast<StoreInst>(I)->isAtomic())
     return false;
+
+  const Value *PtrV = I->getOperand(1);
+  if (TLI.supportSwiftError()) {
+    // Swifterror values can come from either a function parameter with
+    // swifterror attribute or an alloca with swifterror attribute.
+    if (const Argument *Arg = dyn_cast<Argument>(PtrV)) {
+      if (Arg->hasSwiftErrorAttr())
+        return false;
+    }
+
+    if (const AllocaInst *Alloca = dyn_cast<AllocaInst>(PtrV)) {
+      if (Alloca->isSwiftError())
+        return false;
+    }
+  }
 
   // Verify we have a legal type before going any further.
   MVT VT;
@@ -1847,6 +1877,7 @@ CCAssignFn *ARMFastISel::CCAssignFnForCall(CallingConv::ID CC,
     }
     // Fallthrough
   case CallingConv::C:
+  case CallingConv::CXX_FAST_TLS:
     // Use target triple & subtarget features to do actual dispatch.
     if (Subtarget->isAAPCS_ABI()) {
       if (Subtarget->hasVFP2() &&
@@ -1854,9 +1885,11 @@ CCAssignFn *ARMFastISel::CCAssignFnForCall(CallingConv::ID CC,
         return (Return ? RetCC_ARM_AAPCS_VFP: CC_ARM_AAPCS_VFP);
       else
         return (Return ? RetCC_ARM_AAPCS: CC_ARM_AAPCS);
-    } else
-        return (Return ? RetCC_ARM_APCS: CC_ARM_APCS);
+    } else {
+      return (Return ? RetCC_ARM_APCS: CC_ARM_APCS);
+    }
   case CallingConv::ARM_AAPCS_VFP:
+  case CallingConv::Swift:
     if (!isVarArg)
       return (Return ? RetCC_ARM_AAPCS_VFP: CC_ARM_AAPCS_VFP);
     // Fall through to soft float variant, variadic functions don't
@@ -2082,6 +2115,13 @@ bool ARMFastISel::SelectRet(const Instruction *I) {
   if (!FuncInfo.CanLowerReturn)
     return false;
 
+  if (TLI.supportSwiftError() &&
+      F.getAttributes().hasAttrSomewhere(Attribute::SwiftError))
+    return false;
+
+  if (TLI.supportSplitCSR(FuncInfo.MF))
+    return false;
+
   // Build a list of return value registers.
   SmallVector<unsigned, 4> RetRegs;
 
@@ -2291,8 +2331,7 @@ bool ARMFastISel::SelectCall(const Instruction *I,
 
   // TODO: Avoid some calling conventions?
 
-  PointerType *PT = cast<PointerType>(CS.getCalledValue()->getType());
-  FunctionType *FTy = cast<FunctionType>(PT->getElementType());
+  FunctionType *FTy = CS.getFunctionType();
   bool isVarArg = FTy->isVarArg();
 
   // Handle *simple* calls for now.
@@ -2341,6 +2380,8 @@ bool ARMFastISel::SelectCall(const Instruction *I,
     // FIXME: Only handle *easy* calls for now.
     if (CS.paramHasAttr(AttrInd, Attribute::InReg) ||
         CS.paramHasAttr(AttrInd, Attribute::StructRet) ||
+        CS.paramHasAttr(AttrInd, Attribute::SwiftSelf) ||
+        CS.paramHasAttr(AttrInd, Attribute::SwiftError) ||
         CS.paramHasAttr(AttrInd, Attribute::Nest) ||
         CS.paramHasAttr(AttrInd, Attribute::ByVal))
       return false;
@@ -2938,48 +2979,51 @@ bool ARMFastISel::tryToFoldLoadIntoMI(MachineInstr *MI, unsigned OpNo,
 
 unsigned ARMFastISel::ARMLowerPICELF(const GlobalValue *GV,
                                      unsigned Align, MVT VT) {
-  bool UseGOTOFF = GV->hasLocalLinkage() || GV->hasHiddenVisibility();
-  ARMConstantPoolConstant *CPV =
-    ARMConstantPoolConstant::Create(GV, UseGOTOFF ? ARMCP::GOTOFF : ARMCP::GOT);
-  unsigned Idx = MCP.getConstantPoolIndex(CPV, Align);
+  bool UseGOT_PREL =
+      !(GV->hasHiddenVisibility() || GV->hasLocalLinkage());
 
-  unsigned Opc;
-  unsigned DestReg1 = createResultReg(TLI.getRegClassFor(VT));
-  // Load value.
-  if (isThumb2) {
-    DestReg1 = constrainOperandRegClass(TII.get(ARM::t2LDRpci), DestReg1, 0);
-    AddOptionalDefs(BuildMI(*FuncInfo.MBB, FuncInfo.InsertPt, DbgLoc,
-                            TII.get(ARM::t2LDRpci), DestReg1)
-                    .addConstantPoolIndex(Idx));
-    Opc = UseGOTOFF ? ARM::t2ADDrr : ARM::t2LDRs;
-  } else {
-    // The extra immediate is for addrmode2.
-    DestReg1 = constrainOperandRegClass(TII.get(ARM::LDRcp), DestReg1, 0);
-    AddOptionalDefs(BuildMI(*FuncInfo.MBB, FuncInfo.InsertPt,
-                            DbgLoc, TII.get(ARM::LDRcp), DestReg1)
-                    .addConstantPoolIndex(Idx).addImm(0));
-    Opc = UseGOTOFF ? ARM::ADDrr : ARM::LDRrs;
-  }
+  LLVMContext *Context = &MF->getFunction()->getContext();
+  unsigned ARMPCLabelIndex = AFI->createPICLabelUId();
+  unsigned PCAdj = Subtarget->isThumb() ? 4 : 8;
+  ARMConstantPoolValue *CPV = ARMConstantPoolConstant::Create(
+      GV, ARMPCLabelIndex, ARMCP::CPValue, PCAdj,
+      UseGOT_PREL ? ARMCP::GOT_PREL : ARMCP::no_modifier,
+      /*AddCurrentAddress=*/UseGOT_PREL);
 
-  unsigned GlobalBaseReg = AFI->getGlobalBaseReg();
-  if (GlobalBaseReg == 0) {
-    GlobalBaseReg = MRI.createVirtualRegister(TLI.getRegClassFor(VT));
-    AFI->setGlobalBaseReg(GlobalBaseReg);
-  }
+  unsigned ConstAlign =
+      MF->getDataLayout().getPrefTypeAlignment(Type::getInt32PtrTy(*Context));
+  unsigned Idx = MF->getConstantPool()->getConstantPoolIndex(CPV, ConstAlign);
 
-  unsigned DestReg2 = createResultReg(TLI.getRegClassFor(VT));
-  DestReg2 = constrainOperandRegClass(TII.get(Opc), DestReg2, 0);
-  DestReg1 = constrainOperandRegClass(TII.get(Opc), DestReg1, 1);
-  GlobalBaseReg = constrainOperandRegClass(TII.get(Opc), GlobalBaseReg, 2);
-  MachineInstrBuilder MIB = BuildMI(*FuncInfo.MBB, FuncInfo.InsertPt,
-                                    DbgLoc, TII.get(Opc), DestReg2)
-                            .addReg(DestReg1)
-                            .addReg(GlobalBaseReg);
-  if (!UseGOTOFF)
+  unsigned TempReg = MF->getRegInfo().createVirtualRegister(&ARM::rGPRRegClass);
+  unsigned Opc = isThumb2 ? ARM::t2LDRpci : ARM::LDRcp;
+  MachineInstrBuilder MIB =
+      BuildMI(*FuncInfo.MBB, FuncInfo.InsertPt, DbgLoc, TII.get(Opc), TempReg)
+          .addConstantPoolIndex(Idx);
+  if (Opc == ARM::LDRcp)
     MIB.addImm(0);
-  AddOptionalDefs(MIB);
+  AddDefaultPred(MIB);
 
-  return DestReg2;
+  // Fix the address by adding pc.
+  unsigned DestReg = createResultReg(TLI.getRegClassFor(VT));
+  Opc = Subtarget->isThumb() ? ARM::tPICADD : UseGOT_PREL ? ARM::PICLDR
+                                                          : ARM::PICADD;
+  DestReg = constrainOperandRegClass(TII.get(Opc), DestReg, 0);
+  MIB = BuildMI(*FuncInfo.MBB, FuncInfo.InsertPt, DbgLoc, TII.get(Opc), DestReg)
+            .addReg(TempReg)
+            .addImm(ARMPCLabelIndex);
+  if (!Subtarget->isThumb())
+    AddDefaultPred(MIB);
+
+  if (UseGOT_PREL && Subtarget->isThumb()) {
+    unsigned NewDestReg = createResultReg(TLI.getRegClassFor(VT));
+    MIB = BuildMI(*FuncInfo.MBB, FuncInfo.InsertPt, DbgLoc,
+                  TII.get(ARM::t2LDRi12), NewDestReg)
+              .addReg(DestReg)
+              .addImm(0);
+    DestReg = NewDestReg;
+    AddOptionalDefs(MIB);
+  }
+  return DestReg;
 }
 
 bool ARMFastISel::fastLowerArguments() {
@@ -2999,6 +3043,7 @@ bool ARMFastISel::fastLowerArguments() {
   case CallingConv::ARM_AAPCS_VFP:
   case CallingConv::ARM_AAPCS:
   case CallingConv::ARM_APCS:
+  case CallingConv::Swift:
     break;
   }
 
@@ -3012,6 +3057,8 @@ bool ARMFastISel::fastLowerArguments() {
 
     if (F->getAttributes().hasAttribute(Idx, Attribute::InReg) ||
         F->getAttributes().hasAttribute(Idx, Attribute::StructRet) ||
+        F->getAttributes().hasAttribute(Idx, Attribute::SwiftSelf) ||
+        F->getAttributes().hasAttribute(Idx, Attribute::SwiftError) ||
         F->getAttributes().hasAttribute(Idx, Attribute::ByVal))
       return false;
 
@@ -3032,7 +3079,7 @@ bool ARMFastISel::fastLowerArguments() {
   }
 
 
-  static const uint16_t GPRArgRegs[] = {
+  static const MCPhysReg GPRArgRegs[] = {
     ARM::R0, ARM::R1, ARM::R2, ARM::R3
   };
 
@@ -3049,7 +3096,7 @@ bool ARMFastISel::fastLowerArguments() {
     BuildMI(*FuncInfo.MBB, FuncInfo.InsertPt, DbgLoc,
             TII.get(TargetOpcode::COPY),
             ResultReg).addReg(DstReg, getKillRegState(true));
-    updateValueMap(I, ResultReg);
+    updateValueMap(&*I, ResultReg);
   }
 
   return true;

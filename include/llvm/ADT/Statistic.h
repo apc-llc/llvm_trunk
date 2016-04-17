@@ -27,10 +27,12 @@
 #define LLVM_ADT_STATISTIC_H
 
 #include "llvm/Support/Atomic.h"
-#include "llvm/Support/Valgrind.h"
+#include "llvm/Support/Compiler.h"
+#include <memory>
 
 namespace llvm {
 class raw_ostream;
+class raw_fd_ostream;
 
 class Statistic {
 public:
@@ -170,12 +172,15 @@ void EnableStatistics();
 /// \brief Check if statistics are enabled.
 bool AreStatisticsEnabled();
 
+/// \brief Return a file stream to print our output on.
+std::unique_ptr<raw_fd_ostream> CreateInfoOutputFile();
+
 /// \brief Print statistics to the file returned by CreateInfoOutputFile().
 void PrintStatistics();
 
 /// \brief Print statistics to the given output stream.
 void PrintStatistics(raw_ostream &OS);
 
-} // End llvm namespace
+} // end llvm namespace
 
-#endif
+#endif // LLVM_ADT_STATISTIC_H

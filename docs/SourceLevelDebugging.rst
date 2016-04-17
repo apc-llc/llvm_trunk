@@ -197,7 +197,7 @@ value.  The first argument is the new value (wrapped as metadata).  The second
 argument is the offset in the user source variable where the new value is
 written.  The third argument is a `local variable
 <LangRef.html#dilocalvariable>`_ containing a description of the variable.  The
-third argument is a `complex expression <LangRef.html#diexpression>`_.
+fourth argument is a `complex expression <LangRef.html#diexpression>`_.
 
 Object lifetimes and scoping
 ============================
@@ -231,7 +231,7 @@ Compiled to LLVM, this function would be represented like this:
 .. code-block:: llvm
 
   ; Function Attrs: nounwind ssp uwtable
-  define void @foo() #0 {
+  define void @foo() #0 !dbg !4 {
   entry:
     %X = alloca i32, align 4
     %Y = alloca i32, align 4
@@ -259,11 +259,11 @@ Compiled to LLVM, this function would be represented like this:
   !llvm.module.flags = !{!7, !8, !9}
   !llvm.ident = !{!10}
 
-  !0 = !DICompileUnit(language: DW_LANG_C99, file: !1, producer: "clang version 3.7.0 (trunk 231150) (llvm/trunk 231154)", isOptimized: false, runtimeVersion: 0, emissionKind: 1, enums: !2, retainedTypes: !2, subprograms: !3, globals: !2, imports: !2)
+  !0 = !DICompileUnit(language: DW_LANG_C99, file: !1, producer: "clang version 3.7.0 (trunk 231150) (llvm/trunk 231154)", isOptimized: false, runtimeVersion: 0, emissionKind: FullDebug, enums: !2, retainedTypes: !2, subprograms: !3, globals: !2, imports: !2)
   !1 = !DIFile(filename: "/dev/stdin", directory: "/Users/dexonsmith/data/llvm/debug-info")
   !2 = !{}
   !3 = !{!4}
-  !4 = distinct !DISubprogram(name: "foo", scope: !1, file: !1, line: 1, type: !5, isLocal: false, isDefinition: true, scopeLine: 1, isOptimized: false, function: void ()* @foo, variables: !2)
+  !4 = distinct !DISubprogram(name: "foo", scope: !1, file: !1, line: 1, type: !5, isLocal: false, isDefinition: true, scopeLine: 1, isOptimized: false, variables: !2)
   !5 = !DISubroutineType(types: !6)
   !6 = !{null}
   !7 = !{i32 2, !"Dwarf Version", i32 2}
@@ -304,10 +304,9 @@ scope information for the variable ``X``.
 .. code-block:: llvm
 
   !14 = !DILocation(line: 2, column: 9, scope: !4)
-  !4 = !DISubprogram(name: "foo", scope: !1, file: !1, line: 1, type: !5,
-                     isLocal: false, isDefinition: true, scopeLine: 1,
-                     isOptimized: false, function: void ()* @foo,
-                     variables: !2)
+  !4 = distinct !DISubprogram(name: "foo", scope: !1, file: !1, line: 1, type: !5,
+                              isLocal: false, isDefinition: true, scopeLine: 1,
+                              isOptimized: false, variables: !2)
 
 Here ``!14`` is metadata providing `location information
 <LangRef.html#dilocation>`_.  In this example, scope is encoded by ``!4``, a
@@ -408,7 +407,7 @@ a C/C++ front-end would generate the following descriptors:
   !0 = !DICompileUnit(language: DW_LANG_C99, file: !1,
                       producer:
                       "clang version 3.7.0 (trunk 231150) (llvm/trunk 231154)",
-                      isOptimized: false, runtimeVersion: 0, emissionKind: 1,
+                      isOptimized: false, runtimeVersion: 0, emissionKind: FullDebug,
                       enums: !2, retainedTypes: !2, subprograms: !2, globals:
                       !3, imports: !2)
 
@@ -463,12 +462,12 @@ a C/C++ front-end would generate the following descriptors:
   !4 = !DISubprogram(name: "main", scope: !1, file: !1, line: 1, type: !5,
                      isLocal: false, isDefinition: true, scopeLine: 1,
                      flags: DIFlagPrototyped, isOptimized: false,
-                     function: i32 (i32, i8**)* @main, variables: !2)
+                     variables: !2)
 
   ;;
   ;; Define the subprogram itself.
   ;;
-  define i32 @main(i32 %argc, i8** %argv) {
+  define i32 @main(i32 %argc, i8** %argv) !dbg !4 {
   ...
   }
 
@@ -708,7 +707,7 @@ qualified name.  Debugger users tend not to enter their search strings as
 "``a::b::c``".  So the name entered in the name table must be demangled in
 order to chop it up appropriately and additional names must be manually entered
 into the table to make it effective as a name lookup table for debuggers to
-se.
+use.
 
 All debuggers currently ignore the "``.debug_pubnames``" table as a result of
 its inconsistent and useless public-only name content making it a waste of

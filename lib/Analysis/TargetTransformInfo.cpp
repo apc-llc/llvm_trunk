@@ -66,6 +66,10 @@ int TargetTransformInfo::getCallCost(const Function *F,
   return Cost;
 }
 
+unsigned TargetTransformInfo::getInliningThresholdMultiplier() const {
+  return TTIImpl->getInliningThresholdMultiplier();
+}
+
 int TargetTransformInfo::getIntrinsicCost(
     Intrinsic::ID IID, Type *RetTy, ArrayRef<const Value *> Arguments) const {
   int Cost = TTIImpl->getIntrinsicCost(IID, RetTy, Arguments);
@@ -113,14 +117,20 @@ bool TargetTransformInfo::isLegalAddressingMode(Type *Ty, GlobalValue *BaseGV,
                                         Scale, AddrSpace);
 }
 
-bool TargetTransformInfo::isLegalMaskedStore(Type *DataType,
-                                             int Consecutive) const {
-  return TTIImpl->isLegalMaskedStore(DataType, Consecutive);
+bool TargetTransformInfo::isLegalMaskedStore(Type *DataType) const {
+  return TTIImpl->isLegalMaskedStore(DataType);
 }
 
-bool TargetTransformInfo::isLegalMaskedLoad(Type *DataType,
-                                            int Consecutive) const {
-  return TTIImpl->isLegalMaskedLoad(DataType, Consecutive);
+bool TargetTransformInfo::isLegalMaskedLoad(Type *DataType) const {
+  return TTIImpl->isLegalMaskedLoad(DataType);
+}
+
+bool TargetTransformInfo::isLegalMaskedGather(Type *DataType) const {
+  return TTIImpl->isLegalMaskedGather(DataType);
+}
+
+bool TargetTransformInfo::isLegalMaskedScatter(Type *DataType) const {
+  return TTIImpl->isLegalMaskedGather(DataType);
 }
 
 int TargetTransformInfo::getScalingFactorCost(Type *Ty, GlobalValue *BaseGV,
@@ -136,10 +146,6 @@ int TargetTransformInfo::getScalingFactorCost(Type *Ty, GlobalValue *BaseGV,
 
 bool TargetTransformInfo::isTruncateFree(Type *Ty1, Type *Ty2) const {
   return TTIImpl->isTruncateFree(Ty1, Ty2);
-}
-
-bool TargetTransformInfo::isZExtFree(Type *Ty1, Type *Ty2) const {
-  return TTIImpl->isZExtFree(Ty1, Ty2);
 }
 
 bool TargetTransformInfo::isProfitableToHoist(Instruction *I) const {
@@ -168,6 +174,10 @@ bool TargetTransformInfo::enableAggressiveInterleaving(bool LoopHasReductions) c
 
 bool TargetTransformInfo::enableInterleavedAccessVectorization() const {
   return TTIImpl->enableInterleavedAccessVectorization();
+}
+
+bool TargetTransformInfo::isFPVectorizationPotentiallyUnsafe() const {
+  return TTIImpl->isFPVectorizationPotentiallyUnsafe();
 }
 
 TargetTransformInfo::PopcntSupportKind
@@ -211,6 +221,22 @@ unsigned TargetTransformInfo::getNumberOfRegisters(bool Vector) const {
 
 unsigned TargetTransformInfo::getRegisterBitWidth(bool Vector) const {
   return TTIImpl->getRegisterBitWidth(Vector);
+}
+
+unsigned TargetTransformInfo::getCacheLineSize() const {
+  return TTIImpl->getCacheLineSize();
+}
+
+unsigned TargetTransformInfo::getPrefetchDistance() const {
+  return TTIImpl->getPrefetchDistance();
+}
+
+unsigned TargetTransformInfo::getMinPrefetchStride() const {
+  return TTIImpl->getMinPrefetchStride();
+}
+
+unsigned TargetTransformInfo::getMaxPrefetchIterationsAhead() const {
+  return TTIImpl->getMaxPrefetchIterationsAhead();
 }
 
 unsigned TargetTransformInfo::getMaxInterleaveFactor(unsigned VF) const {
@@ -278,6 +304,15 @@ int TargetTransformInfo::getMaskedMemoryOpCost(unsigned Opcode, Type *Src,
   return Cost;
 }
 
+int TargetTransformInfo::getGatherScatterOpCost(unsigned Opcode, Type *DataTy,
+                                                Value *Ptr, bool VariableMask,
+                                                unsigned Alignment) const {
+  int Cost = TTIImpl->getGatherScatterOpCost(Opcode, DataTy, Ptr, VariableMask,
+                                             Alignment);
+  assert(Cost >= 0 && "TTI should not produce negative costs!");
+  return Cost;
+}
+
 int TargetTransformInfo::getInterleavedMemoryOpCost(
     unsigned Opcode, Type *VecTy, unsigned Factor, ArrayRef<unsigned> Indices,
     unsigned Alignment, unsigned AddressSpace) const {
@@ -288,8 +323,17 @@ int TargetTransformInfo::getInterleavedMemoryOpCost(
 }
 
 int TargetTransformInfo::getIntrinsicInstrCost(Intrinsic::ID ID, Type *RetTy,
-                                               ArrayRef<Type *> Tys) const {
-  int Cost = TTIImpl->getIntrinsicInstrCost(ID, RetTy, Tys);
+                                               ArrayRef<Type *> Tys,
+                                               FastMathFlags FMF) const {
+  int Cost = TTIImpl->getIntrinsicInstrCost(ID, RetTy, Tys, FMF);
+  assert(Cost >= 0 && "TTI should not produce negative costs!");
+  return Cost;
+}
+
+int TargetTransformInfo::getIntrinsicInstrCost(Intrinsic::ID ID, Type *RetTy,
+                                               ArrayRef<Value *> Args,
+                                               FastMathFlags FMF) const {
+  int Cost = TTIImpl->getIntrinsicInstrCost(ID, RetTy, Args, FMF);
   assert(Cost >= 0 && "TTI should not produce negative costs!");
   return Cost;
 }
@@ -344,16 +388,16 @@ TargetTransformInfo::Concept::~Concept() {}
 TargetIRAnalysis::TargetIRAnalysis() : TTICallback(&getDefaultTTI) {}
 
 TargetIRAnalysis::TargetIRAnalysis(
-    std::function<Result(Function &)> TTICallback)
+    std::function<Result(const Function &)> TTICallback)
     : TTICallback(TTICallback) {}
 
-TargetIRAnalysis::Result TargetIRAnalysis::run(Function &F) {
+TargetIRAnalysis::Result TargetIRAnalysis::run(const Function &F) {
   return TTICallback(F);
 }
 
 char TargetIRAnalysis::PassID;
 
-TargetIRAnalysis::Result TargetIRAnalysis::getDefaultTTI(Function &F) {
+TargetIRAnalysis::Result TargetIRAnalysis::getDefaultTTI(const Function &F) {
   return Result(F.getParent()->getDataLayout());
 }
 
@@ -377,7 +421,7 @@ TargetTransformInfoWrapperPass::TargetTransformInfoWrapperPass(
       *PassRegistry::getPassRegistry());
 }
 
-TargetTransformInfo &TargetTransformInfoWrapperPass::getTTI(Function &F) {
+TargetTransformInfo &TargetTransformInfoWrapperPass::getTTI(const Function &F) {
   TTI = TIRA.run(F);
   return *TTI;
 }

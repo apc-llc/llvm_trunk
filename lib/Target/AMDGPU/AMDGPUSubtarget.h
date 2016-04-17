@@ -1,4 +1,4 @@
-//=====-- AMDGPUSubtarget.h - Define Subtarget for the AMDIL ---*- C++ -*-====//
+//=====-- AMDGPUSubtarget.h - Define Subtarget for AMDGPU ------*- C++ -*-====//
 //
 //                     The LLVM Compiler Infrastructure
 //
@@ -12,18 +12,17 @@
 //
 //===----------------------------------------------------------------------===//
 
-#ifndef LLVM_LIB_TARGET_R600_AMDGPUSUBTARGET_H
-#define LLVM_LIB_TARGET_R600_AMDGPUSUBTARGET_H
+#ifndef LLVM_LIB_TARGET_AMDGPU_AMDGPUSUBTARGET_H
+#define LLVM_LIB_TARGET_AMDGPU_AMDGPUSUBTARGET_H
+
 #include "AMDGPU.h"
 #include "AMDGPUFrameLowering.h"
 #include "AMDGPUInstrInfo.h"
-#include "AMDGPUIntrinsicInfo.h"
+#include "AMDGPUISelLowering.h"
 #include "AMDGPUSubtarget.h"
-#include "R600ISelLowering.h"
-#include "AMDKernelCodeT.h"
 #include "Utils/AMDGPUBaseInfo.h"
-#include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/CodeGen/GlobalISel/GISelAccessor.h"
 #include "llvm/Target/TargetSubtargetInfo.h"
 
 #define GET_SUBTARGETINFO_HEADER
@@ -55,12 +54,11 @@ public:
     ISAVersion7_0_0,
     ISAVersion7_0_1,
     ISAVersion8_0_0,
-    ISAVersion8_0_1
+    ISAVersion8_0_1,
+    ISAVersion8_0_3
   };
 
 private:
-  std::string DevName;
-  bool Is64bit;
   bool DumpCode;
   bool R600ALUInst;
   bool HasVertexCache;
@@ -69,31 +67,39 @@ private:
   bool FP64;
   bool FP64Denormals;
   bool FP32Denormals;
+  bool FPExceptions;
   bool FastFMAF32;
+  bool HalfRate64Ops;
   bool CaymanISA;
   bool FlatAddressSpace;
+  bool FlatForGlobal;
   bool EnableIRStructurizer;
   bool EnablePromoteAlloca;
   bool EnableIfCvt;
   bool EnableLoadStoreOpt;
   bool EnableUnsafeDSOffsetFolding;
+  bool EnableXNACK;
   unsigned WavefrontSize;
   bool CFALUBug;
   int LocalMemorySize;
+  unsigned MaxPrivateElementSize;
   bool EnableVGPRSpilling;
   bool SGPRInitBug;
   bool IsGCN;
   bool GCN1Encoding;
   bool GCN3Encoding;
   bool CIInsts;
+  bool HasSMemRealTime;
+  bool Has16BitInsts;
   bool FeatureDisable;
   int LDSBankCount;
-  unsigned IsaVersion; 
-  bool EnableHugeScratchBuffer;
+  unsigned IsaVersion;
+  bool EnableSIScheduler;
 
-  AMDGPUFrameLowering FrameLowering;
+  std::unique_ptr<AMDGPUFrameLowering> FrameLowering;
   std::unique_ptr<AMDGPUTargetLowering> TLInfo;
   std::unique_ptr<AMDGPUInstrInfo> InstrInfo;
+  std::unique_ptr<GISelAccessor> GISel;
   InstrItineraryData InstrItins;
   Triple TargetTriple;
 
@@ -103,8 +109,12 @@ public:
   AMDGPUSubtarget &initializeSubtargetDependencies(const Triple &TT,
                                                    StringRef GPU, StringRef FS);
 
+  void setGISelAccessor(GISelAccessor &GISel) {
+    this->GISel.reset(&GISel);
+  }
+
   const AMDGPUFrameLowering *getFrameLowering() const override {
-    return &FrameLowering;
+    return FrameLowering.get();
   }
   const AMDGPUInstrInfo *getInstrInfo() const override {
     return InstrInfo.get();
@@ -119,11 +129,9 @@ public:
     return &InstrItins;
   }
 
-  void ParseSubtargetFeatures(StringRef CPU, StringRef FS);
+  const CallLowering *getCallLowering() const override;
 
-  bool is64bit() const {
-    return Is64bit;
-  }
+  void ParseSubtargetFeatures(StringRef CPU, StringRef FS);
 
   bool hasVertexCache() const {
     return HasVertexCache;
@@ -153,12 +161,32 @@ public:
     return FP64Denormals;
   }
 
+  bool hasFPExceptions() const {
+    return FPExceptions;
+  }
+
   bool hasFastFMAF32() const {
     return FastFMAF32;
   }
 
+  bool hasHalfRate64Ops() const {
+    return HalfRate64Ops;
+  }
+
   bool hasFlatAddressSpace() const {
     return FlatAddressSpace;
+  }
+
+  bool hasSMemRealTime() const {
+    return HasSMemRealTime;
+  }
+
+  bool has16BitInsts() const {
+    return Has16BitInsts;
+  }
+
+  bool useFlatForGlobal() const {
+    return FlatForGlobal;
   }
 
   bool hasBFE() const {
@@ -243,6 +271,10 @@ public:
     return LocalMemorySize;
   }
 
+  unsigned getMaxPrivateElementSize() const {
+    return MaxPrivateElementSize;
+  }
+
   bool hasSGPRInitBug() const {
     return SGPRInitBug;
   }
@@ -268,12 +300,8 @@ public:
     return false;
   }
 
-  StringRef getDeviceName() const {
-    return DevName;
-  }
-
-  bool enableHugeScratchBuffer() const {
-    return EnableHugeScratchBuffer;
+  bool enableSIScheduler() const {
+    return EnableSIScheduler;
   }
 
   bool dumpCode() const {
@@ -285,7 +313,11 @@ public:
   bool isAmdHsaOS() const {
     return TargetTriple.getOS() == Triple::AMDHSA;
   }
-  bool isVGPRSpillingEnabled(const SIMachineFunctionInfo *MFI) const;
+  bool isVGPRSpillingEnabled(const Function& F) const;
+
+  bool isXNACKEnabled() const {
+    return EnableXNACK;
+  }
 
   unsigned getMaxWavesPerCU() const {
     if (getGeneration() >= AMDGPUSubtarget::SOUTHERN_ISLANDS)
@@ -305,6 +337,9 @@ public:
     return isAmdHsaOS() ? 0 : 36;
   }
 
+  unsigned getMaxNumUserSGPRs() const {
+    return 16;
+  }
 };
 
 } // End namespace llvm

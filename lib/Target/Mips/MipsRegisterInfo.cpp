@@ -13,7 +13,6 @@
 
 #include "MipsRegisterInfo.h"
 #include "Mips.h"
-#include "MipsAnalyzeImmediate.h"
 #include "MipsInstrInfo.h"
 #include "MipsMachineFunction.h"
 #include "MipsSubtarget.h"
@@ -52,7 +51,13 @@ const TargetRegisterClass *
 MipsRegisterInfo::getPointerRegClass(const MachineFunction &MF,
                                      unsigned Kind) const {
   MipsABIInfo ABI = MF.getSubtarget<MipsSubtarget>().getABI();
-  return ABI.ArePtrs64bit() ? &Mips::GPR64RegClass : &Mips::GPR32RegClass;
+  bool inMicroMips = MF.getSubtarget<MipsSubtarget>().inMicroMipsMode();
+ 
+  return ABI.ArePtrs64bit() ?
+             inMicroMips ?
+                 &Mips::GPRMM16_64RegClass : &Mips::GPR64RegClass
+             : inMicroMips ?
+                 &Mips::GPRMM16RegClass : &Mips::GPR32RegClass;
 }
 
 unsigned
@@ -84,6 +89,16 @@ MipsRegisterInfo::getRegPressureLimit(const TargetRegisterClass *RC,
 const MCPhysReg *
 MipsRegisterInfo::getCalleeSavedRegs(const MachineFunction *MF) const {
   const MipsSubtarget &Subtarget = MF->getSubtarget<MipsSubtarget>();
+  const Function *F = MF->getFunction();
+  if (F->hasFnAttribute("interrupt")) {
+    if (Subtarget.hasMips64())
+      return Subtarget.hasMips64r6() ? CSR_Interrupt_64R6_SaveList
+                                     : CSR_Interrupt_64_SaveList;
+    else
+      return Subtarget.hasMips32r6() ? CSR_Interrupt_32R6_SaveList
+                                     : CSR_Interrupt_32_SaveList;
+  }
+
   if (Subtarget.isSingleFloat())
     return CSR_SingleFloatOnly_SaveList;
 

@@ -181,18 +181,6 @@ void FunctionRecordIterator::skipOtherFiles() {
     *this = FunctionRecordIterator();
 }
 
-/// Get the function name from the record, removing the filename prefix if
-/// necessary.
-static StringRef getFuncNameWithoutPrefix(const CoverageMappingRecord &Record) {
-  StringRef FunctionName = Record.FunctionName;
-  if (Record.Filenames.empty())
-    return FunctionName;
-  StringRef Filename = sys::path::filename(Record.Filenames[0]);
-  if (FunctionName.startswith(Filename))
-    FunctionName = FunctionName.drop_front(Filename.size() + 1);
-  return FunctionName;
-}
-
 ErrorOr<std::unique_ptr<CoverageMapping>>
 CoverageMapping::load(CoverageMappingReader &CoverageReader,
                       IndexedInstrProfReader &ProfileReader) {
@@ -216,7 +204,13 @@ CoverageMapping::load(CoverageMappingReader &CoverageReader,
 
     assert(!Record.MappingRegions.empty() && "Function has no regions");
 
-    FunctionRecord Function(getFuncNameWithoutPrefix(Record), Record.Filenames);
+    StringRef OrigFuncName = Record.FunctionName;
+    if (Record.Filenames.empty())
+      OrigFuncName = getFuncNameWithoutPrefix(OrigFuncName);
+    else
+      OrigFuncName =
+          getFuncNameWithoutPrefix(OrigFuncName, Record.Filenames[0]);
+    FunctionRecord Function(OrigFuncName, Record.Filenames);
     for (const auto &Region : Record.MappingRegions) {
       ErrorOr<int64_t> ExecutionCount = Ctx.evaluate(Region.Count);
       if (!ExecutionCount)
@@ -278,8 +272,10 @@ public:
 };
 
 class SegmentBuilder {
-  std::vector<CoverageSegment> Segments;
+  std::vector<CoverageSegment> &Segments;
   SmallVector<const CountedRegion *, 8> ActiveRegions;
+
+  SegmentBuilder(std::vector<CoverageSegment> &Segments) : Segments(Segments) {}
 
   /// Start a segment with no count specified.
   void startSegment(unsigned Line, unsigned Col) {
@@ -324,9 +320,7 @@ class SegmentBuilder {
       startSegment(Line, Col, false, *ActiveRegions.back());
   }
 
-public:
-  /// Build a list of CoverageSegments from a sorted list of Regions.
-  std::vector<CoverageSegment> buildSegments(ArrayRef<CountedRegion> Regions) {
+  void buildSegmentsImpl(ArrayRef<CountedRegion> Regions) {
     const CountedRegion *PrevRegion = nullptr;
     for (const auto &Region : Regions) {
       // Pop any regions that end before this one starts.
@@ -347,6 +341,15 @@ public:
     // Pop any regions that are left in the stack.
     while (!ActiveRegions.empty())
       popRegion();
+  }
+
+public:
+  /// Build a list of CoverageSegments from a sorted list of Regions.
+  static std::vector<CoverageSegment>
+  buildSegments(ArrayRef<CountedRegion> Regions) {
+    std::vector<CoverageSegment> Segments;
+    SegmentBuilder Builder(Segments);
+    Builder.buildSegmentsImpl(Regions);
     return Segments;
   }
 };
@@ -432,7 +435,7 @@ CoverageData CoverageMapping::getCoverageForFile(StringRef Filename) {
 
   sortNestedRegions(Regions.begin(), Regions.end());
   DEBUG(dbgs() << "Emitting segments for file: " << Filename << "\n");
-  FileCoverage.Segments = SegmentBuilder().buildSegments(Regions);
+  FileCoverage.Segments = SegmentBuilder::buildSegments(Regions);
 
   return FileCoverage;
 }
@@ -474,7 +477,7 @@ CoverageMapping::getCoverageForFunction(const FunctionRecord &Function) {
 
   sortNestedRegions(Regions.begin(), Regions.end());
   DEBUG(dbgs() << "Emitting segments for function: " << Function.Name << "\n");
-  FunctionCoverage.Segments = SegmentBuilder().buildSegments(Regions);
+  FunctionCoverage.Segments = SegmentBuilder::buildSegments(Regions);
 
   return FunctionCoverage;
 }
@@ -494,7 +497,7 @@ CoverageMapping::getCoverageForExpansion(const ExpansionRecord &Expansion) {
   sortNestedRegions(Regions.begin(), Regions.end());
   DEBUG(dbgs() << "Emitting segments for expansion of file " << Expansion.FileID
                << "\n");
-  ExpansionCoverage.Segments = SegmentBuilder().buildSegments(Regions);
+  ExpansionCoverage.Segments = SegmentBuilder::buildSegments(Regions);
 
   return ExpansionCoverage;
 }
@@ -525,6 +528,6 @@ class CoverageMappingErrorCategoryType : public std::error_category {
 
 static ManagedStatic<CoverageMappingErrorCategoryType> ErrorCategory;
 
-const std::error_category &llvm::coveragemap_category() {
+const std::error_category &llvm::coverage::coveragemap_category() {
   return *ErrorCategory;
 }

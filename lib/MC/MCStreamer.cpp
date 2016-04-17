@@ -107,8 +107,7 @@ void MCStreamer::EmitSLEB128IntValue(int64_t Value) {
   EmitBytes(OSE.str());
 }
 
-void MCStreamer::EmitValue(const MCExpr *Value, unsigned Size,
-                           const SMLoc &Loc) {
+void MCStreamer::EmitValue(const MCExpr *Value, unsigned Size, SMLoc Loc) {
   EmitValueImpl(Value, Size, Loc);
 }
 
@@ -175,11 +174,41 @@ MCDwarfFrameInfo *MCStreamer::getCurrentDwarfFrameInfo() {
   return &DwarfFrameInfos.back();
 }
 
+bool MCStreamer::hasUnfinishedDwarfFrameInfo() {
+  MCDwarfFrameInfo *CurFrame = getCurrentDwarfFrameInfo();
+  return CurFrame && !CurFrame->End;
+}
+
 void MCStreamer::EnsureValidDwarfFrame() {
   MCDwarfFrameInfo *CurFrame = getCurrentDwarfFrameInfo();
   if (!CurFrame || CurFrame->End)
     report_fatal_error("No open frame");
 }
+
+unsigned MCStreamer::EmitCVFileDirective(unsigned FileNo, StringRef Filename) {
+  return getContext().getCVFile(Filename, FileNo);
+}
+
+void MCStreamer::EmitCVLocDirective(unsigned FunctionId, unsigned FileNo,
+                                    unsigned Line, unsigned Column,
+                                    bool PrologueEnd, bool IsStmt,
+                                    StringRef FileName) {
+  getContext().setCurrentCVLoc(FunctionId, FileNo, Line, Column, PrologueEnd,
+                               IsStmt);
+}
+
+void MCStreamer::EmitCVLinetableDirective(unsigned FunctionId,
+                                          const MCSymbol *Begin,
+                                          const MCSymbol *End) {}
+
+void MCStreamer::EmitCVInlineLinetableDirective(
+    unsigned PrimaryFunctionId, unsigned SourceFileId, unsigned SourceLineNum,
+    const MCSymbol *FnStartSym, const MCSymbol *FnEndSym,
+    ArrayRef<unsigned> SecondaryFunctionIds) {}
+
+void MCStreamer::EmitCVDefRangeDirective(
+    ArrayRef<std::pair<const MCSymbol *, const MCSymbol *>> Ranges,
+    StringRef FixedSizePortion) {}
 
 void MCStreamer::EmitEHSymAttributes(const MCSymbol *Symbol,
                                      MCSymbol *EHSymbol) {
@@ -189,11 +218,9 @@ void MCStreamer::InitSections(bool NoExecStack) {
   SwitchSection(getContext().getObjectFileInfo()->getTextSection());
 }
 
-void MCStreamer::AssignSection(MCSymbol *Symbol, MCSection *Section) {
-  if (Section)
-    Symbol->setSection(*Section);
-  else
-    Symbol->setUndefined();
+void MCStreamer::AssignFragment(MCSymbol *Symbol, MCFragment *Fragment) {
+  assert(Fragment);
+  Symbol->setFragment(Fragment);
 
   // As we emit symbols into a section, track the order so that they can
   // be sorted upon later. Zero is reserved to mean 'unemitted'.
@@ -203,7 +230,8 @@ void MCStreamer::AssignSection(MCSymbol *Symbol, MCSection *Section) {
 void MCStreamer::EmitLabel(MCSymbol *Symbol) {
   assert(!Symbol->isVariable() && "Cannot emit a variable symbol!");
   assert(getCurrentSection().first && "Cannot emit before setting section!");
-  AssignSection(Symbol, getCurrentSection().first);
+  assert(!Symbol->getFragment() && "Unexpected fragment on symbol data!");
+  Symbol->setFragment(&getCurrentSectionOnly()->getDummyFragment());
 
   MCTargetStreamer *TS = getTargetStreamer();
   if (TS)
@@ -215,8 +243,7 @@ void MCStreamer::EmitCFISections(bool EH, bool Debug) {
 }
 
 void MCStreamer::EmitCFIStartProc(bool IsSimple) {
-  MCDwarfFrameInfo *CurFrame = getCurrentDwarfFrameInfo();
-  if (CurFrame && !CurFrame->End)
+  if (hasUnfinishedDwarfFrameInfo())
     report_fatal_error("Starting a frame before finishing the previous one!");
 
   MCDwarfFrameInfo Frame;
@@ -357,6 +384,14 @@ void MCStreamer::EmitCFIRestore(int64_t Register) {
 void MCStreamer::EmitCFIEscape(StringRef Values) {
   MCSymbol *Label = EmitCFICommon();
   MCCFIInstruction Instruction = MCCFIInstruction::createEscape(Label, Values);
+  MCDwarfFrameInfo *CurFrame = getCurrentDwarfFrameInfo();
+  CurFrame->Instructions.push_back(Instruction);
+}
+
+void MCStreamer::EmitCFIGnuArgsSize(int64_t Size) {
+  MCSymbol *Label = EmitCFICommon();
+  MCCFIInstruction Instruction = 
+    MCCFIInstruction::createGnuArgsSize(Label, Size);
   MCDwarfFrameInfo *CurFrame = getCurrentDwarfFrameInfo();
   CurFrame->Instructions.push_back(Instruction);
 }
@@ -681,8 +716,7 @@ void MCStreamer::EmitTBSSSymbol(MCSection *Section, MCSymbol *Symbol,
 void MCStreamer::ChangeSection(MCSection *, const MCExpr *) {}
 void MCStreamer::EmitWeakReference(MCSymbol *Alias, const MCSymbol *Symbol) {}
 void MCStreamer::EmitBytes(StringRef Data) {}
-void MCStreamer::EmitValueImpl(const MCExpr *Value, unsigned Size,
-                               const SMLoc &Loc) {
+void MCStreamer::EmitValueImpl(const MCExpr *Value, unsigned Size, SMLoc Loc) {
   visitUsedExpr(*Value);
 }
 void MCStreamer::EmitULEB128Value(const MCExpr *Value) {}
@@ -692,9 +726,7 @@ void MCStreamer::EmitValueToAlignment(unsigned ByteAlignment, int64_t Value,
                                       unsigned MaxBytesToEmit) {}
 void MCStreamer::EmitCodeAlignment(unsigned ByteAlignment,
                                    unsigned MaxBytesToEmit) {}
-bool MCStreamer::EmitValueToOffset(const MCExpr *Offset, unsigned char Value) {
-  return false;
-}
+void MCStreamer::emitValueToOffset(const MCExpr *Offset, unsigned char Value) {}
 void MCStreamer::EmitBundleAlignMode(unsigned AlignPow2) {}
 void MCStreamer::EmitBundleLock(bool AlignToEnd) {}
 void MCStreamer::FinishImpl() {}

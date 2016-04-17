@@ -10,6 +10,7 @@
 #ifndef LLVM_TOOLS_LLVM_READOBJ_STREAMWRITER_H
 #define LLVM_TOOLS_LLVM_READOBJ_STREAMWRITER_H
 
+#include "llvm/ADT/APSInt.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
@@ -19,14 +20,23 @@
 #include <algorithm>
 
 using namespace llvm;
-using namespace llvm::support;
 
 namespace llvm {
 
 template<typename T>
 struct EnumEntry {
   StringRef Name;
+  // While Name suffices in most of the cases, in certain cases
+  // GNU style and LLVM style of ELFDumper do not
+  // display same string for same enum. The AltName if initialized appropriately
+  // will hold the string that GNU style emits.
+  // Example:
+  // "EM_X86_64" string on LLVM style for Elf_Ehdr->e_machine corresponds to
+  // "Advanced Micro Devices X86-64" on GNU style
+  StringRef AltName;
   T Value;
+  EnumEntry(StringRef N, StringRef A, T V) : Name(N), AltName(A), Value(V) {}
+  EnumEntry(StringRef N, T V) : Name(N), AltName(N), Value(V) {}
 };
 
 struct HexNumber {
@@ -34,18 +44,29 @@ struct HexNumber {
   // unsigned type. The overloads are here so that every type that is implicitly
   // convertible to an integer (including enums and endian helpers) can be used
   // without requiring type traits or call-site changes.
-  HexNumber(int8_t   Value) : Value(static_cast<uint8_t >(Value)) { }
-  HexNumber(int16_t  Value) : Value(static_cast<uint16_t>(Value)) { }
-  HexNumber(int32_t  Value) : Value(static_cast<uint32_t>(Value)) { }
-  HexNumber(int64_t  Value) : Value(static_cast<uint64_t>(Value)) { }
-  HexNumber(uint8_t  Value) : Value(Value) { }
-  HexNumber(uint16_t Value) : Value(Value) { }
-  HexNumber(uint32_t Value) : Value(Value) { }
-  HexNumber(uint64_t Value) : Value(Value) { }
+  HexNumber(char             Value) : Value(static_cast<unsigned char>(Value)) { }
+  HexNumber(signed char      Value) : Value(static_cast<unsigned char>(Value)) { }
+  HexNumber(signed short     Value) : Value(static_cast<unsigned short>(Value)) { }
+  HexNumber(signed int       Value) : Value(static_cast<unsigned int>(Value)) { }
+  HexNumber(signed long      Value) : Value(static_cast<unsigned long>(Value)) { }
+  HexNumber(signed long long Value) : Value(static_cast<unsigned long long>(Value)) { }
+  HexNumber(unsigned char      Value) : Value(Value) { }
+  HexNumber(unsigned short     Value) : Value(Value) { }
+  HexNumber(unsigned int       Value) : Value(Value) { }
+  HexNumber(unsigned long      Value) : Value(Value) { }
+  HexNumber(unsigned long long Value) : Value(Value) { }
   uint64_t Value;
 };
 
 raw_ostream &operator<<(raw_ostream &OS, const HexNumber& Value);
+const std::string to_hexString(uint64_t Value, bool UpperCase = true);
+
+template <class T> const std::string to_string(const T &Value) {
+  std::string number;
+  llvm::raw_string_ostream stream(number);
+  stream << Value;
+  return stream.str();
+}
 
 class StreamWriter {
 public:
@@ -177,6 +198,10 @@ public:
     startLine() << Label << ": " << int(Value) << "\n";
   }
 
+  void printNumber(StringRef Label, APSInt Value) {
+    startLine() << Label << ": " << Value << "\n";
+  }
+
   void printBoolean(StringRef Label, bool Value) {
     startLine() << Label << ": " << (Value ? "Yes" : "No") << '\n';
   }
@@ -194,6 +219,19 @@ public:
     OS << "]\n";
   }
 
+  template <typename T>
+  void printHexList(StringRef Label, const T &List) {
+    startLine() << Label << ": [";
+    bool Comma = false;
+    for (const auto &Item : List) {
+      if (Comma)
+        OS << ", ";
+      OS << hex(Item);
+      Comma = true;
+    }
+    OS << "]\n";
+  }
+
   template<typename T>
   void printHex(StringRef Label, T Value) {
     startLine() << Label << ": " << hex(Value) << "\n";
@@ -202,6 +240,11 @@ public:
   template<typename T>
   void printHex(StringRef Label, StringRef Str, T Value) {
     startLine() << Label << ": " << Str << " (" << hex(Value) << ")\n";
+  }
+
+  template <typename T>
+  void printSymbolOffset(StringRef Label, StringRef Symbol, T Value) {
+    startLine() << Label << ": " << Symbol << '+' << hex(Value) << '\n';
   }
 
   void printString(StringRef Label, StringRef Value) {
@@ -270,6 +313,13 @@ private:
   raw_ostream &OS;
   int IndentLevel;
 };
+
+template <>
+inline void
+StreamWriter::printHex<support::ulittle16_t>(StringRef Label,
+                                             support::ulittle16_t Value) {
+  startLine() << Label << ": " << hex(Value) << "\n";
+}
 
 struct DictScope {
   DictScope(StreamWriter& W, StringRef N) : W(W) {

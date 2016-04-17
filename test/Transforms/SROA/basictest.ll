@@ -1,4 +1,5 @@
 ; RUN: opt < %s -sroa -S | FileCheck %s
+; RUN: opt < %s -passes=sroa -S | FileCheck %s
 
 target datalayout = "e-p:64:64:64-p1:16:16:16-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:32:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-n8:16:32:64"
 
@@ -1632,3 +1633,39 @@ entry:
   %load = load i16, i16* %bc2
   ret i16 %load
 }
+
+%struct.STest = type { %struct.SPos, %struct.SPos }
+%struct.SPos = type { float, float }
+
+define void @PR25873(%struct.STest* %outData) {
+; CHECK-LABEL: @PR25873(
+; CHECK: store i32 1123418112
+; CHECK: store i32 1139015680
+; CHECK: %[[HIZEXT:.*]] = zext i32 1139015680 to i64
+; CHECK: %[[HISHL:.*]] = shl i64 %[[HIZEXT]], 32
+; CHECK: %[[HIMASK:.*]] = and i64 undef, 4294967295
+; CHECK: %[[HIINSERT:.*]] = or i64 %[[HIMASK]], %[[HISHL]]
+; CHECK: %[[LOZEXT:.*]] = zext i32 1123418112 to i64
+; CHECK: %[[LOMASK:.*]] = and i64 %[[HIINSERT]], -4294967296
+; CHECK: %[[LOINSERT:.*]] = or i64 %[[LOMASK]], %[[LOZEXT]]
+; CHECK: store i64 %[[LOINSERT]]
+entry:
+  %tmpData = alloca %struct.STest, align 8
+  %0 = bitcast %struct.STest* %tmpData to i8*
+  call void @llvm.lifetime.start(i64 16, i8* %0)
+  %x = getelementptr inbounds %struct.STest, %struct.STest* %tmpData, i64 0, i32 0, i32 0
+  store float 1.230000e+02, float* %x, align 8
+  %y = getelementptr inbounds %struct.STest, %struct.STest* %tmpData, i64 0, i32 0, i32 1
+  store float 4.560000e+02, float* %y, align 4
+  %m_posB = getelementptr inbounds %struct.STest, %struct.STest* %tmpData, i64 0, i32 1
+  %1 = bitcast %struct.STest* %tmpData to i64*
+  %2 = bitcast %struct.SPos* %m_posB to i64*
+  %3 = load i64, i64* %1, align 8
+  store i64 %3, i64* %2, align 8
+  %4 = bitcast %struct.STest* %outData to i8*
+  call void @llvm.memcpy.p0i8.p0i8.i64(i8* %4, i8* %0, i64 16, i32 4, i1 false)
+  call void @llvm.lifetime.end(i64 16, i8* %0)
+  ret void
+}
+
+declare void @llvm.memcpy.p0i8.p0i8.i64(i8* nocapture, i8* nocapture, i64, i32, i1) nounwind
